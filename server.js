@@ -61,12 +61,12 @@ wss.on('connection', (ws, req) => {
     tenantId,
     userId,
     deepgramConnection: null,
-    deepgramReady: false, // Track if Deepgram is ready
+    deepgramReady: false,
     conversationHistory: [],
     isActive: true,
     ws: ws,
     streamSid: null,
-    audioQueue: [] // Queue audio until Deepgram is ready
+    audioQueue: []
   };
 
   activeSessions.set(callSid, session);
@@ -135,8 +135,20 @@ async function initializeDeepgramConnection(session) {
   try {
     console.log('🎯 Initializing Deepgram connection...');
 
-    // Create WebSocket connection to Deepgram
-    const deepgramWs = new WebSocket('wss://api.deepgram.com/v1/listen', {
+    // Create WebSocket connection to Deepgram with proper URL parameters
+    const deepgramUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
+      encoding: 'mulaw',
+      sample_rate: '8000',
+      channels: '1',
+      model: 'nova-2',
+      language: 'en-US',
+      interim_results: 'true',
+      punctuate: 'true',
+      utterance_end_ms: '1000',
+      endpointing: '300'
+    });
+
+    const deepgramWs = new WebSocket(deepgramUrl, {
       headers: {
         'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
       },
@@ -144,28 +156,7 @@ async function initializeDeepgramConnection(session) {
 
     // Handle connection open
     deepgramWs.on('open', () => {
-      console.log('✅ Connected to Deepgram');
-      
-      // Send configuration for Twilio audio format
-      const config = {
-        type: 'Configure',
-        processors: {
-          stt: {
-            language: 'en-US',
-            model: 'nova-2',
-            interim_results: true,
-            punctuate: true,
-            utterance_end_ms: 1000,
-            endpointing: 300,
-            encoding: 'mulaw', // Twilio uses μ-law encoding
-            sample_rate: 8000,  // Twilio uses 8kHz
-            channels: 1
-          }
-        }
-      };
-      
-      deepgramWs.send(JSON.stringify(config));
-      console.log('📡 Sent Deepgram configuration for Twilio audio');
+      console.log('✅ Connected to Deepgram with proper audio configuration');
       
       // Mark as ready and process queued audio
       session.deepgramReady = true;
@@ -184,9 +175,10 @@ async function initializeDeepgramConnection(session) {
     deepgramWs.on('message', async (message) => {
       try {
         const response = JSON.parse(message);
+        console.log('🎯 Deepgram response:', JSON.stringify(response, null, 2));
         
-        if (response.type === 'Results') {
-          const transcript = response.channel?.alternatives?.[0]?.transcript;
+        if (response.channel && response.channel.alternatives && response.channel.alternatives.length > 0) {
+          const transcript = response.channel.alternatives[0].transcript;
           
           if (transcript && transcript.length > 0) {
             if (response.is_final) {
@@ -219,8 +211,8 @@ async function initializeDeepgramConnection(session) {
       session.deepgramReady = false;
     });
 
-    deepgramWs.on('close', () => {
-      console.log('🔌 Deepgram connection closed');
+    deepgramWs.on('close', (code, reason) => {
+      console.log(`🔌 Deepgram connection closed: ${code} - ${reason}`);
       session.deepgramReady = false;
     });
 
