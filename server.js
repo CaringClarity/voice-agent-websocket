@@ -1,6 +1,6 @@
 /**
- * Enhanced WebSocket server with improved Twilio integration
- * Fixes voice consistency and audio streaming issues
+ * Enhanced WebSocket server with fixed Deepgram initialization
+ * Resolves silent call issue and ensures welcome message plays
  */
 const express = require('express');
 const http = require('http');
@@ -185,7 +185,7 @@ app.get('/debug', (req, res) => {
 });
 
 // WebSocket connection handler
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
   // Parse URL parameters
   const url = new URL(req.url, `http://${req.headers.host}`);
   const callSid = url.searchParams.get('callSid');
@@ -214,9 +214,17 @@ wss.on('connection', (ws, req) => {
 
   activeSessions.set(callSid, session);
 
-  // Send immediate welcome message
+  // CRITICAL FIX: Initialize Deepgram immediately
+  // Don't wait for start event which might not come
+  console.log("🚀 Initializing Deepgram immediately on connection");
+  await initializeDeepgramConnection(session);
+  
+  // Send welcome message after a short delay
   setTimeout(() => {
-    sendWelcomeMessage(session);
+    if (!session.welcomeMessageSent) {
+      console.log("🎤 Sending welcome message after connection");
+      sendWelcomeMessage(session);
+    }
   }, 1000);
 
   ws.on('message', async (message) => {
@@ -227,7 +235,37 @@ wss.on('connection', (ws, req) => {
       try {
         const data = JSON.parse(message);
         console.log(`📨 Received event: ${data.event}`);
-        await handleTwilioMessage(ws, session, data);
+        
+        // Store streamSid if this is a start event
+        if (data.event === 'start' && data.start && data.start.streamSid) {
+          session.streamSid = data.start.streamSid;
+          console.log(`🎙️ Stream started with SID: ${session.streamSid}`);
+        }
+        
+        // Handle media event
+        if (data.event === 'media' && data.media && data.media.payload && data.media.track === 'inbound') {
+          // Convert from base64
+          const audioBuffer = Buffer.from(data.media.payload, 'base64');
+          
+          // Check if Deepgram is ready
+          if (session.deepgramReady && session.deepgramConnection && 
+              session.deepgramConnection.readyState === WebSocket.OPEN) {
+            session.deepgramConnection.send(audioBuffer);
+            console.log('🎤 Forwarded audio to Deepgram');
+          } else {
+            // Queue audio until Deepgram is ready
+            if (session.audioQueue.length < 500) {
+              session.audioQueue.push(audioBuffer);
+              console.log(`📦 Queued audio chunk (queue size: ${session.audioQueue.length})`);
+            }
+          }
+        }
+        
+        // Handle stop event
+        if (data.event === 'stop') {
+          console.log('🛑 Stream stopped');
+          await cleanupSession(session.callSid);
+        }
       } catch (jsonError) {
         // Not JSON, might be binary audio data
         console.log(`📦 Received binary data, length: ${message.length} bytes`);
@@ -236,10 +274,12 @@ wss.on('connection', (ws, req) => {
         if (session.deepgramReady && session.deepgramConnection && 
             session.deepgramConnection.readyState === WebSocket.OPEN) {
           session.deepgramConnection.send(message);
+          console.log('🎤 Forwarded binary audio to Deepgram');
         } else {
           // Queue audio until Deepgram is ready
           if (session.audioQueue.length < 500) {
             session.audioQueue.push(message);
+            console.log(`📦 Queued binary audio chunk (queue size: ${session.audioQueue.length})`);
           }
         }
       }
@@ -258,52 +298,6 @@ wss.on('connection', (ws, req) => {
     cleanupSession(callSid);
   });
 });
-
-async function handleTwilioMessage(ws, session, data) {
-  const { event, media, streamSid } = data;
-
-  switch (event) {
-    case 'connected':
-      console.log('🔗 Twilio stream connected');
-      break;
-
-    case 'start':
-      console.log('🎙️ Bidirectional stream started');
-      console.log('Stream SID:', streamSid);
-      session.streamSid = streamSid;
-      await initializeDeepgramConnection(session);
-      break;
-
-    case 'media':
-      if (media?.payload && media.track === 'inbound') {
-        // Convert from base64
-        const audioBuffer = Buffer.from(media.payload, 'base64');
-        
-        // Check if Deepgram is ready
-        if (session.deepgramReady && session.deepgramConnection && 
-            session.deepgramConnection.readyState === WebSocket.OPEN) {
-          session.deepgramConnection.send(audioBuffer);
-          console.log('🎤 Forwarded audio to Deepgram');
-        } else {
-          // Queue audio until Deepgram is ready
-          if (session.audioQueue.length < 500) {
-            session.audioQueue.push(audioBuffer);
-            console.log(`📦 Queued audio chunk (queue size: ${session.audioQueue.length})`);
-          }
-        }
-      }
-      break;
-
-    case 'stop':
-      console.log('🛑 Stream stopped');
-      await cleanupSession(session.callSid);
-      break;
-      
-    default:
-      console.log(`📩 Unhandled event type: ${event}`);
-      break;
-  }
-}
 
 async function initializeDeepgramConnection(session) {
   try {
@@ -345,7 +339,14 @@ async function initializeDeepgramConnection(session) {
         const audioBuffer = session.audioQueue.shift();
         if (deepgramWs.readyState === WebSocket.OPEN) {
           deepgramWs.send(audioBuffer);
+          console.log('📤 Sent queued audio chunk to Deepgram');
         }
+      }
+      
+      // Check if welcome message should be sent
+      if (!session.welcomeMessageSent) {
+        console.log('🔊 Sending welcome message after Deepgram connection');
+        sendWelcomeMessage(session);
       }
     });
 
@@ -353,7 +354,7 @@ async function initializeDeepgramConnection(session) {
     deepgramWs.on('message', async (message) => {
       try {
         const response = JSON.parse(message);
-        console.log('📝 Deepgram response:', JSON.stringify(response));
+        console.log('📝 Deepgram response received');
         
         let transcript = "";
         let isFinal = false;
@@ -490,13 +491,25 @@ async function sendWelcomeMessage(session) {
     
     if (audioBuffer) {
       // Send audio back to Twilio
-      await sendAudioToTwilio(session, audioBuffer);
+      const success = await sendAudioToTwilio(session, audioBuffer);
       
-      // Add to conversation history
-      session.conversationHistory.push({ role: "assistant", content: welcomeMessage });
-      
-      session.welcomeMessageSent = true;
-      console.log(`✅ Welcome message sent for call ${session.callSid}`);
+      if (success) {
+        // Add to conversation history
+        session.conversationHistory.push({ role: "assistant", content: welcomeMessage });
+        
+        session.welcomeMessageSent = true;
+        console.log(`✅ Welcome message sent for call ${session.callSid}`);
+      } else {
+        console.error(`❌ Failed to send welcome message for call ${session.callSid}`);
+        // Try again after a delay
+        setTimeout(() => {
+          if (!session.welcomeMessageSent) {
+            sendWelcomeMessage(session);
+          }
+        }, 2000);
+      }
+    } else {
+      console.error(`❌ Failed to generate welcome message audio for call ${session.callSid}`);
     }
   } catch (error) {
     console.error('❌ Error sending welcome message:', error);
@@ -569,7 +582,7 @@ async function generateAIResponse(transcript, session) {
     });
 
     const result = await response.json();
-    console.log('AI response result:', JSON.stringify(result));
+    console.log('AI response result received');
     
     const aiMessage = result.choices?.[0]?.message?.content;
 
@@ -619,6 +632,12 @@ async function generateDeepgramTTS(text) {
 
 async function sendAudioToTwilio(session, audioBuffer) {
   try {
+    // Check if we have a streamSid
+    if (!session.streamSid) {
+      console.error('❌ Cannot send audio to Twilio: No streamSid available');
+      return false;
+    }
+    
     // Convert audio to base64 for Twilio
     const base64Audio = audioBuffer.toString('base64');
     
