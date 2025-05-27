@@ -61,9 +61,12 @@ wss.on('connection', (ws, req) => {
     tenantId,
     userId,
     deepgramConnection: null,
+    deepgramReady: false, // Track if Deepgram is ready
     conversationHistory: [],
     isActive: true,
-    ws: ws // Store WebSocket reference for sending audio back
+    ws: ws,
+    streamSid: null,
+    audioQueue: [] // Queue audio until Deepgram is ready
   };
 
   activeSessions.set(callSid, session);
@@ -71,6 +74,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message);
+      console.log(`📨 Received event: ${data.event}`);
       await handleTwilioMessage(ws, session, data);
     } catch (error) {
       console.error('❌ WebSocket message error:', error);
@@ -98,14 +102,25 @@ async function handleTwilioMessage(ws, session, data) {
 
     case 'start':
       console.log('🎙️ Bidirectional stream started');
+      session.streamSid = streamSid;
       await initializeDeepgramConnection(session);
       break;
 
     case 'media':
-      if (media?.payload && session.deepgramConnection && media.track === 'inbound') {
-        // Only process inbound audio (caller's voice)
+      if (media?.payload && media.track === 'inbound') {
+        console.log(`🎵 Received audio chunk: ${media.payload.length} bytes`);
+        
+        // Convert from base64
         const audioBuffer = Buffer.from(media.payload, 'base64');
-        session.deepgramConnection.send(audioBuffer);
+        
+        // Check if Deepgram is ready
+        if (session.deepgramReady && session.deepgramConnection && session.deepgramConnection.readyState === WebSocket.OPEN) {
+          session.deepgramConnection.send(audioBuffer);
+        } else {
+          // Queue audio until Deepgram is ready
+          session.audioQueue.push(audioBuffer);
+          console.log(`📦 Queued audio chunk (queue size: ${session.audioQueue.length})`);
+        }
       }
       break;
 
@@ -127,22 +142,42 @@ async function initializeDeepgramConnection(session) {
       },
     });
 
-    // Send configuration to Deepgram
+    // Handle connection open
     deepgramWs.on('open', () => {
       console.log('✅ Connected to Deepgram');
-      deepgramWs.send(JSON.stringify({
+      
+      // Send configuration for Twilio audio format
+      const config = {
         type: 'Configure',
         processors: {
           stt: {
-            language: 'en',
+            language: 'en-US',
             model: 'nova-2',
-            interim_results: false, // Only final results for better performance
+            interim_results: true,
             punctuate: true,
             utterance_end_ms: 1000,
             endpointing: 300,
+            encoding: 'mulaw', // Twilio uses μ-law encoding
+            sample_rate: 8000,  // Twilio uses 8kHz
+            channels: 1
           }
         }
-      }));
+      };
+      
+      deepgramWs.send(JSON.stringify(config));
+      console.log('📡 Sent Deepgram configuration for Twilio audio');
+      
+      // Mark as ready and process queued audio
+      session.deepgramReady = true;
+      console.log(`🚀 Deepgram ready! Processing ${session.audioQueue.length} queued audio chunks`);
+      
+      // Send all queued audio
+      while (session.audioQueue.length > 0) {
+        const audioBuffer = session.audioQueue.shift();
+        if (deepgramWs.readyState === WebSocket.OPEN) {
+          deepgramWs.send(audioBuffer);
+        }
+      }
     });
 
     // Handle transcription results
@@ -153,20 +188,24 @@ async function initializeDeepgramConnection(session) {
         if (response.type === 'Results') {
           const transcript = response.channel?.alternatives?.[0]?.transcript;
           
-          if (transcript && transcript.length > 0 && response.is_final) {
-            console.log('📝 Final transcript:', transcript);
-            
-            // Process with AI
-            const aiResponse = await generateAIResponse(transcript, session);
-            
-            if (aiResponse) {
-              // Generate audio with Deepgram TTS
-              const audioBuffer = await generateDeepgramTTS(aiResponse);
+          if (transcript && transcript.length > 0) {
+            if (response.is_final) {
+              console.log('📝 Final transcript:', transcript);
               
-              if (audioBuffer) {
-                // Send audio back to Twilio
-                await sendAudioToTwilio(session, audioBuffer);
+              // Process with AI
+              const aiResponse = await generateAIResponse(transcript, session);
+              
+              if (aiResponse) {
+                // Generate audio with Deepgram TTS
+                const audioBuffer = await generateDeepgramTTS(aiResponse);
+                
+                if (audioBuffer) {
+                  // Send audio back to Twilio
+                  await sendAudioToTwilio(session, audioBuffer);
+                }
               }
+            } else {
+              console.log('📝 Interim transcript:', transcript);
             }
           }
         }
@@ -177,6 +216,12 @@ async function initializeDeepgramConnection(session) {
 
     deepgramWs.on('error', (error) => {
       console.error('❌ Deepgram connection error:', error);
+      session.deepgramReady = false;
+    });
+
+    deepgramWs.on('close', () => {
+      console.log('🔌 Deepgram connection closed');
+      session.deepgramReady = false;
     });
 
     session.deepgramConnection = deepgramWs;
@@ -188,6 +233,8 @@ async function initializeDeepgramConnection(session) {
 
 async function generateAIResponse(transcript, session) {
   try {
+    console.log('🤖 Generating AI response for:', transcript);
+    
     // Add to conversation history
     session.conversationHistory.push({
       role: 'user',
@@ -222,6 +269,8 @@ async function generateAIResponse(transcript, session) {
     const aiMessage = result.choices?.[0]?.message?.content;
 
     if (aiMessage) {
+      console.log('🤖 AI response:', aiMessage);
+      
       // Add AI response to history
       session.conversationHistory.push({
         role: 'assistant',
@@ -245,7 +294,9 @@ async function generateAIResponse(transcript, session) {
 
 async function generateDeepgramTTS(text) {
   try {
-    const response = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en', {
+    console.log('🎤 Generating Deepgram TTS for:', text);
+    
+    const response = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000', {
       method: 'POST',
       headers: {
         'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
@@ -257,7 +308,11 @@ async function generateDeepgramTTS(text) {
     });
 
     if (response.ok) {
-      return Buffer.from(await response.arrayBuffer());
+      const audioBuffer = Buffer.from(await response.arrayBuffer());
+      console.log('✅ Deepgram TTS generated successfully');
+      return audioBuffer;
+    } else {
+      console.error('❌ Deepgram TTS failed:', response.status, response.statusText);
     }
   } catch (error) {
     console.error('❌ Deepgram TTS error:', error);
@@ -273,7 +328,7 @@ async function sendAudioToTwilio(session, audioBuffer) {
     // Send media message back to Twilio stream
     const mediaMessage = {
       event: 'media',
-      streamSid: session.callSid,
+      streamSid: session.streamSid,
       media: {
         payload: base64Audio
       }
@@ -283,6 +338,8 @@ async function sendAudioToTwilio(session, audioBuffer) {
     if (session.ws && session.ws.readyState === WebSocket.OPEN) {
       session.ws.send(JSON.stringify(mediaMessage));
       console.log('🔊 Audio response sent to Twilio');
+    } else {
+      console.error('❌ WebSocket not open for sending audio');
     }
     
   } catch (error) {
@@ -302,6 +359,7 @@ async function logConversationTurn(session, userMessage, aiResponse) {
         user_id: session.userId
       }
     });
+    console.log('💾 Conversation logged to database');
   } catch (error) {
     console.error('❌ Error logging conversation:', error);
   }
