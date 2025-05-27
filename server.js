@@ -1,7 +1,6 @@
 /**
- * Self-contained WebSocket server for Render deployment
- * All functionality included directly in this file with no external dependencies
- * Uses built-in fetch API (Node.js v18+)
+ * Enhanced WebSocket server with improved Twilio integration
+ * Fixes voice consistency and audio streaming issues
  */
 const express = require('express');
 const http = require('http');
@@ -34,7 +33,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Create WebSocket server
+// Create WebSocket server with explicit path
 const wss = new WebSocket.Server({ 
   server,
   path: '/stream'
@@ -187,12 +186,14 @@ app.get('/debug', (req, res) => {
 
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
+  // Parse URL parameters
   const url = new URL(req.url, `http://${req.headers.host}`);
   const callSid = url.searchParams.get('callSid');
   const tenantId = url.searchParams.get('tenantId');
   const userId = url.searchParams.get('userId');
 
   console.log(`📞 New WebSocket connection: ${callSid}`);
+  console.log(`URL parameters: callSid=${callSid}, tenantId=${tenantId}, userId=${userId}`);
 
   // Initialize session
   const session = {
@@ -213,11 +214,35 @@ wss.on('connection', (ws, req) => {
 
   activeSessions.set(callSid, session);
 
+  // Send immediate welcome message
+  setTimeout(() => {
+    sendWelcomeMessage(session);
+  }, 1000);
+
   ws.on('message', async (message) => {
     try {
-      const data = JSON.parse(message);
-      console.log(`📨 Received event: ${data.event}`);
-      await handleTwilioMessage(ws, session, data);
+      console.log(`📥 Received raw message of length: ${message.length} bytes`);
+      
+      // Try to parse as JSON
+      try {
+        const data = JSON.parse(message);
+        console.log(`📨 Received event: ${data.event}`);
+        await handleTwilioMessage(ws, session, data);
+      } catch (jsonError) {
+        // Not JSON, might be binary audio data
+        console.log(`📦 Received binary data, length: ${message.length} bytes`);
+        
+        // If Deepgram is ready, forward the audio
+        if (session.deepgramReady && session.deepgramConnection && 
+            session.deepgramConnection.readyState === WebSocket.OPEN) {
+          session.deepgramConnection.send(message);
+        } else {
+          // Queue audio until Deepgram is ready
+          if (session.audioQueue.length < 500) {
+            session.audioQueue.push(message);
+          }
+        }
+      }
     } catch (error) {
       console.error('❌ WebSocket message error:', error);
     }
@@ -244,6 +269,7 @@ async function handleTwilioMessage(ws, session, data) {
 
     case 'start':
       console.log('🎙️ Bidirectional stream started');
+      console.log('Stream SID:', streamSid);
       session.streamSid = streamSid;
       await initializeDeepgramConnection(session);
       break;
@@ -254,8 +280,10 @@ async function handleTwilioMessage(ws, session, data) {
         const audioBuffer = Buffer.from(media.payload, 'base64');
         
         // Check if Deepgram is ready
-        if (session.deepgramReady && session.deepgramConnection && session.deepgramConnection.readyState === WebSocket.OPEN) {
+        if (session.deepgramReady && session.deepgramConnection && 
+            session.deepgramConnection.readyState === WebSocket.OPEN) {
           session.deepgramConnection.send(audioBuffer);
+          console.log('🎤 Forwarded audio to Deepgram');
         } else {
           // Queue audio until Deepgram is ready
           if (session.audioQueue.length < 500) {
@@ -269,6 +297,10 @@ async function handleTwilioMessage(ws, session, data) {
     case 'stop':
       console.log('🛑 Stream stopped');
       await cleanupSession(session.callSid);
+      break;
+      
+    default:
+      console.log(`📩 Unhandled event type: ${event}`);
       break;
   }
 }
@@ -290,6 +322,8 @@ async function initializeDeepgramConnection(session) {
       utterance_end_ms: '1000',
       endpointing: '300'
     });
+
+    console.log('Connecting to Deepgram:', deepgramUrl);
 
     const deepgramWs = new WebSocket(deepgramUrl, {
       headers: {
@@ -313,17 +347,13 @@ async function initializeDeepgramConnection(session) {
           deepgramWs.send(audioBuffer);
         }
       }
-      
-      // Check if welcome message should be sent
-      if (!session.welcomeMessageSent) {
-        sendWelcomeMessage(session);
-      }
     });
 
     // Handle transcription results
     deepgramWs.on('message', async (message) => {
       try {
         const response = JSON.parse(message);
+        console.log('📝 Deepgram response:', JSON.stringify(response));
         
         let transcript = "";
         let isFinal = false;
@@ -453,6 +483,7 @@ async function sendWelcomeMessage(session) {
     }
     
     const welcomeMessage = "Thank you for calling Caring Clarity Counseling, my name is Clara. How can I help you today?";
+    console.log(`🎙️ Sending welcome message for call ${session.callSid}`);
     
     // Generate audio with Deepgram TTS
     const audioBuffer = await generateDeepgramTTS(welcomeMessage);
@@ -538,6 +569,8 @@ async function generateAIResponse(transcript, session) {
     });
 
     const result = await response.json();
+    console.log('AI response result:', JSON.stringify(result));
+    
     const aiMessage = result.choices?.[0]?.message?.content;
 
     if (aiMessage) {
@@ -574,7 +607,8 @@ async function generateDeepgramTTS(text) {
       console.log('✅ Deepgram TTS generated successfully');
       return audioBuffer;
     } else {
-      console.error('❌ Deepgram TTS failed:', response.status, response.statusText);
+      const errorText = await response.text();
+      console.error('❌ Deepgram TTS failed:', response.status, response.statusText, errorText);
       return null;
     }
   } catch (error) {
