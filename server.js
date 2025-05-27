@@ -1,12 +1,12 @@
 /**
  * Self-contained WebSocket server for Render deployment
  * All functionality included directly in this file with no external dependencies
+ * Uses built-in fetch API (Node.js v18+)
  */
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
-const fetch = require('node-fetch');
 
 // Initialize Express app and HTTP server
 const app = express();
