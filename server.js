@@ -7,6 +7,23 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
+// Check required environment variables
+const requiredEnvVars = [
+  'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY', 
+  'DEEPGRAM_API_KEY',
+  'GROQ_API_KEY'
+];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`❌ Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
+
+console.log('✅ All environment variables loaded');
+
 // Initialize Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -45,7 +62,8 @@ wss.on('connection', (ws, req) => {
     userId,
     deepgramConnection: null,
     conversationHistory: [],
-    isActive: true
+    isActive: true,
+    ws: ws // Store WebSocket reference for sending audio back
   };
 
   activeSessions.set(callSid, session);
@@ -79,13 +97,13 @@ async function handleTwilioMessage(ws, session, data) {
       break;
 
     case 'start':
-      console.log('🎙️ Stream started');
+      console.log('🎙️ Bidirectional stream started');
       await initializeDeepgramConnection(session);
       break;
 
     case 'media':
-      if (media?.payload && session.deepgramConnection) {
-        // Forward audio to Deepgram
+      if (media?.payload && session.deepgramConnection && media.track === 'inbound') {
+        // Only process inbound audio (caller's voice)
         const audioBuffer = Buffer.from(media.payload, 'base64');
         session.deepgramConnection.send(audioBuffer);
       }
@@ -118,7 +136,7 @@ async function initializeDeepgramConnection(session) {
           stt: {
             language: 'en',
             model: 'nova-2',
-            interim_results: true,
+            interim_results: false, // Only final results for better performance
             punctuate: true,
             utterance_end_ms: 1000,
             endpointing: 300,
@@ -253,9 +271,19 @@ async function sendAudioToTwilio(session, audioBuffer) {
     const base64Audio = audioBuffer.toString('base64');
     
     // Send media message back to Twilio stream
-    console.log('🔊 Sending audio response to Twilio');
+    const mediaMessage = {
+      event: 'media',
+      streamSid: session.callSid,
+      media: {
+        payload: base64Audio
+      }
+    };
     
-    // Note: In a real implementation, you'd send this back through the Twilio WebSocket
+    // Send through WebSocket back to Twilio
+    if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+      session.ws.send(JSON.stringify(mediaMessage));
+      console.log('🔊 Audio response sent to Twilio');
+    }
     
   } catch (error) {
     console.error('❌ Error sending audio to Twilio:', error);
