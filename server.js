@@ -1,6 +1,6 @@
 /**
- * Enhanced WebSocket server with fixed Deepgram initialization
- * Resolves silent call issue and ensures welcome message plays
+ * Enhanced WebSocket Server for Twilio Voice Assistant
+ * With Deepgram TTS for greeting and responses
  */
 const express = require('express');
 const http = require('http');
@@ -33,7 +33,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Create WebSocket server with explicit path
+// Create WebSocket server with explicit path for Twilio streams
 const wss = new WebSocket.Server({ 
   server,
   path: '/stream'
@@ -50,36 +50,6 @@ app.get('/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     version: process.env.npm_package_version || '1.0.0'
-  });
-});
-
-// Environment variables check endpoint
-app.get('/health/env', (req, res) => {
-  // Check required environment variables
-  const envStatus = {
-    DEEPGRAM_API_KEY: !!process.env.DEEPGRAM_API_KEY,
-    SUPABASE_URL: !!(process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL),
-    SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
-    GROQ_API_KEY: !!process.env.GROQ_API_KEY,
-  };
-  
-  const missingVars = Object.entries(envStatus)
-    .filter(([_, value]) => !value)
-    .map(([key]) => key);
-  
-  if (missingVars.length > 0) {
-    return res.json({
-      status: "warning",
-      message: "Some environment variables are missing",
-      missingVars,
-      timestamp: new Date().toISOString(),
-    });
-  }
-  
-  return res.json({
-    status: "healthy",
-    message: "All required environment variables are set",
-    timestamp: new Date().toISOString(),
   });
 });
 
@@ -124,12 +94,12 @@ app.get('/debug', (req, res) => {
           statusEl.className = 'connecting';
           
           // Create a test session ID
-          const sessionId = 'test-session-' + Date.now();
+          const sessionId = 'session-test-' + Date.now();
           const callSid = 'test-call-' + Date.now();
           
           // Connect to the WebSocket server
           const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-          const wsUrl = \`\${protocol}//\${window.location.host}/stream?callSid=\${callSid}&tenantId=test&userId=test\`;
+          const wsUrl = \`\${protocol}//\${window.location.host}/stream?callSid=\${callSid}&sessionId=\${sessionId}&tenantId=test&userId=test&sendGreeting=true\`;
           log(\`Connecting to \${wsUrl}\`);
           
           ws = new WebSocket(wsUrl);
@@ -189,15 +159,18 @@ wss.on('connection', async (ws, req) => {
   // Parse URL parameters
   const url = new URL(req.url, `http://${req.headers.host}`);
   const callSid = url.searchParams.get('callSid');
+  const sessionId = url.searchParams.get('sessionId') || `session-${callSid}-${Date.now()}`;
   const tenantId = url.searchParams.get('tenantId');
   const userId = url.searchParams.get('userId');
+  const sendGreeting = url.searchParams.get('sendGreeting') === 'true';
 
   console.log(`📞 New WebSocket connection: ${callSid}`);
-  console.log(`URL parameters: callSid=${callSid}, tenantId=${tenantId}, userId=${userId}`);
+  console.log(`URL parameters: callSid=${callSid}, sessionId=${sessionId}, tenantId=${tenantId}, userId=${userId}, sendGreeting=${sendGreeting}`);
 
   // Initialize session
   const session = {
     callSid,
+    sessionId,
     tenantId,
     userId,
     deepgramConnection: null,
@@ -207,25 +180,21 @@ wss.on('connection', async (ws, req) => {
     ws: ws,
     streamSid: null,
     audioQueue: [],
-    welcomeMessageSent: false,
+    // Set welcome message flag based on URL parameter
+    welcomeMessageSent: !sendGreeting,
     reconnectionAttempts: 0,
-    maxReconnectionAttempts: 3
+    maxReconnectionAttempts: 3,
+    isProcessingResponse: false,
+    pendingResponse: false,
+    greetingAttempts: 0,
+    maxGreetingAttempts: 3
   };
 
-  activeSessions.set(callSid, session);
+  activeSessions.set(sessionId, session);
 
   // CRITICAL FIX: Initialize Deepgram immediately
-  // Don't wait for start event which might not come
   console.log("🚀 Initializing Deepgram immediately on connection");
   await initializeDeepgramConnection(session);
-  
-  // Send welcome message after a short delay
-  setTimeout(() => {
-    if (!session.welcomeMessageSent) {
-      console.log("🎤 Sending welcome message after connection");
-      sendWelcomeMessage(session);
-    }
-  }, 1000);
 
   ws.on('message', async (message) => {
     try {
@@ -240,6 +209,11 @@ wss.on('connection', async (ws, req) => {
         if (data.event === 'start' && data.start && data.start.streamSid) {
           session.streamSid = data.start.streamSid;
           console.log(`🎙️ Stream started with SID: ${session.streamSid}`);
+          
+          // Send greeting if needed and we have the streamSid
+          if (!session.welcomeMessageSent && session.streamSid) {
+            await sendGreetingMessage(session);
+          }
         }
         
         // Handle media event
@@ -264,7 +238,7 @@ wss.on('connection', async (ws, req) => {
         // Handle stop event
         if (data.event === 'stop') {
           console.log('🛑 Stream stopped');
-          await cleanupSession(session.callSid);
+          await cleanupSession(session.sessionId);
         }
       } catch (jsonError) {
         // Not JSON, might be binary audio data
@@ -289,13 +263,13 @@ wss.on('connection', async (ws, req) => {
   });
 
   ws.on('close', () => {
-    console.log(`📞 WebSocket closed: ${callSid}`);
-    cleanupSession(callSid);
+    console.log(`📞 WebSocket closed: ${sessionId}`);
+    cleanupSession(sessionId);
   });
 
   ws.on('error', (error) => {
     console.error('❌ WebSocket error:', error);
-    cleanupSession(callSid);
+    cleanupSession(sessionId);
   });
 });
 
@@ -343,10 +317,9 @@ async function initializeDeepgramConnection(session) {
         }
       }
       
-      // Check if welcome message should be sent
-      if (!session.welcomeMessageSent) {
-        console.log('🔊 Sending welcome message after Deepgram connection');
-        sendWelcomeMessage(session);
+      // Send greeting if needed and we have the streamSid
+      if (!session.welcomeMessageSent && session.streamSid) {
+        sendGreetingMessage(session);
       }
     });
 
@@ -475,44 +448,66 @@ async function reconnectDeepgramSTT(session) {
   return await initializeDeepgramConnection(session);
 }
 
-async function sendWelcomeMessage(session) {
+async function sendGreetingMessage(session) {
   try {
-    // Skip if welcome message was already sent
-    if (session.welcomeMessageSent) {
-      console.log(`Welcome message already sent for call ${session.callSid}`);
+    if (session.welcomeMessageSent || !session.streamSid) {
       return;
     }
     
-    const welcomeMessage = "Thank you for calling Caring Clarity Counseling, my name is Clara. How can I help you today?";
-    console.log(`🎙️ Sending welcome message for call ${session.callSid}`);
+    session.greetingAttempts++;
+    console.log(`Sending greeting (attempt ${session.greetingAttempts})...`);
+    
+    // Get tenant configuration if possible
+    let greeting = "Hello! Thank you for calling Caring Clarity Counseling. I am Clara, your AI assistant. How can I help you today?";
+    
+    try {
+      // Try to get tenant-specific configuration
+      const { data: tenant } = await supabase
+        .from("tenants")
+        .select("settings")
+        .eq("id", session.tenantId)
+        .single();
+
+      if (tenant?.settings?.voice_agent?.greeting) {
+        greeting = tenant.settings.voice_agent.greeting;
+      }
+    } catch (error) {
+      console.error('❌ Error fetching tenant greeting, using default:', error);
+    }
     
     // Generate audio with Deepgram TTS
-    const audioBuffer = await generateDeepgramTTS(welcomeMessage);
+    const audioBuffer = await generateDeepgramTTS(greeting);
     
     if (audioBuffer) {
       // Send audio back to Twilio
       const success = await sendAudioToTwilio(session, audioBuffer);
       
       if (success) {
-        // Add to conversation history
-        session.conversationHistory.push({ role: "assistant", content: welcomeMessage });
-        
+        console.log('✅ Greeting sent successfully with Deepgram voice');
         session.welcomeMessageSent = true;
-        console.log(`✅ Welcome message sent for call ${session.callSid}`);
+        
+        // Add to conversation history
+        session.conversationHistory.push(
+          { role: "assistant", content: greeting }
+        );
       } else {
-        console.error(`❌ Failed to send welcome message for call ${session.callSid}`);
-        // Try again after a delay
-        setTimeout(() => {
-          if (!session.welcomeMessageSent) {
-            sendWelcomeMessage(session);
-          }
-        }, 2000);
+        console.error('❌ Failed to send greeting');
+        
+        // Retry if we haven't exceeded max attempts
+        if (session.greetingAttempts < session.maxGreetingAttempts) {
+          console.log(`Will retry greeting in 1 second (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})`);
+          setTimeout(() => sendGreetingMessage(session), 1000);
+        }
       }
-    } else {
-      console.error(`❌ Failed to generate welcome message audio for call ${session.callSid}`);
     }
   } catch (error) {
-    console.error('❌ Error sending welcome message:', error);
+    console.error('❌ Error sending greeting:', error);
+    
+    // Retry if we haven't exceeded max attempts
+    if (session.greetingAttempts < session.maxGreetingAttempts) {
+      console.log(`Will retry greeting in 1 second (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})`);
+      setTimeout(() => sendGreetingMessage(session), 1000);
+    }
   }
 }
 
@@ -686,8 +681,8 @@ async function logConversationTurn(session, userMessage, aiResponse) {
   }
 }
 
-function cleanupSession(callSid) {
-  const session = activeSessions.get(callSid);
+function cleanupSession(sessionId) {
+  const session = activeSessions.get(sessionId);
   if (session) {
     if (session.deepgramConnection) {
       try {
@@ -696,8 +691,8 @@ function cleanupSession(callSid) {
         console.error('❌ Error closing Deepgram connection:', error);
       }
     }
-    activeSessions.delete(callSid);
-    console.log(`🧹 Cleaned up session: ${callSid}`);
+    activeSessions.delete(sessionId);
+    console.log(`🧹 Cleaned up session: ${sessionId}`);
   }
 }
 
