@@ -431,16 +431,15 @@ async function initializeDeepgramConnection(session) {
     console.log('🎯 Initializing Deepgram connection...');
 
     // Create WebSocket connection to Deepgram with proper URL parameters
-    // FIXED: Updated model from nova-2 to nova-2-general for better compatibility
+    // FIXED: Reverted to original working parameters from previous version
     const deepgramUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
       encoding: 'mulaw',
       sample_rate: '8000',
       channels: '1',
-      model: 'nova-2-general', // Changed from nova-2 to nova-2-general
+      model: 'nova-2', // Reverted to original model
       language: 'en-US',
-      interim_results: 'false',
+      interim_results: 'true', // Changed to true as in working version
       punctuate: 'true',
-      smart_format: 'true',
       utterance_end_ms: '1000',
       endpointing: '300'
     });
@@ -497,16 +496,16 @@ async function initializeDeepgramConnection(session) {
         const response = JSON.parse(message);
         console.log('📝 Deepgram response received');
         
+        // FIXED: Updated to match the working version's response handling
         let transcript = "";
         let isFinal = false;
 
-        // Handle different Deepgram response formats
+        // Handle response format from working version
         if (response.channel?.alternatives?.[0]?.transcript) {
           transcript = response.channel.alternatives[0].transcript;
           isFinal = !!response.is_final;
-        } else if (response.alternatives?.[0]?.transcript) {
-          transcript = response.alternatives[0].transcript;
-          isFinal = !!response.is_final;
+          
+          console.log('🎯 Deepgram transcript:', transcript, 'isFinal:', isFinal);
         }
         
         if (transcript && transcript.length > 0) {
