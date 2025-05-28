@@ -805,7 +805,8 @@ async function generateAIResponse(transcript, session) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'llama-3.1-70b-versatile',
+          // FIXED: Updated to use a currently supported model
+          model: 'llama-3.1-70b', // Changed from 'llama-3.1-70b-versatile' to 'llama-3.1-70b'
           messages: [
             {
               role: 'system',
@@ -972,6 +973,12 @@ async function sendAudioToTwilio(session, audioBuffer) {
  */
 async function logConversationTurn(session, userMessage, aiResponse) {
   try {
+    // FIXED: Only attempt to log if we have both messages
+    if (!userMessage || !aiResponse) {
+      console.log('⚠️ Skipping conversation logging due to missing messages');
+      return false;
+    }
+    
     const { error } = await supabase.from('conversation_turns').insert({
       conversation_id: session.callSid,
       user_message: userMessage,
