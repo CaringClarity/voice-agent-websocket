@@ -305,7 +305,9 @@ wss.on('connection', async (ws, req) => {
       totalChunksReceived: 0,
       totalChunksProcessed: 0,
       queueHighWaterMark: 0
-    }
+    },
+    // Add outbound chunk counter for audio sequencing
+    outboundChunkCounter: 1
   };
 
   activeSessions.set(sessionId, session);
@@ -947,12 +949,12 @@ async function generateDeepgramTTS(text) {
       if (retryCount < maxRetries) {
         // Exponential backoff
         const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
-        console.log(`Waiting ${backoffTime}ms before TTS retry`);
+        console.log(`Waiting ${backoffTime}ms before retry...`);
         await new Promise(resolve => setTimeout(resolve, backoffTime));
       }
     }
     
-    console.error(`❌ Deepgram TTS failed after ${maxRetries} attempts:`, lastError);
+    console.error('❌ All Deepgram TTS attempts failed:', lastError);
     return null;
   } catch (error) {
     console.error('❌ Deepgram TTS error:', error);
@@ -983,14 +985,21 @@ async function sendAudioToTwilio(session, audioBuffer) {
     // Convert audio to base64 for Twilio
     const base64Audio = audioBuffer.toString('base64');
     
+    // FIXED: Added proper track direction, chunk sequencing, and timestamp
     // Send media message back to Twilio stream
     const mediaMessage = {
       event: 'media',
       streamSid: session.streamSid,
       media: {
+        track: "outbound",  // Added track direction
+        chunk: session.outboundChunkCounter++,  // Added chunk sequencing
+        timestamp: Date.now(),  // Added timestamp
         payload: base64Audio
       }
     };
+    
+    // Log detailed information about the audio being sent
+    console.log(`🔊 Sending audio to Twilio: ${audioBuffer.length} bytes, chunk ${session.outboundChunkCounter - 1}`);
     
     // Send through WebSocket back to Twilio
     session.ws.send(JSON.stringify(mediaMessage));
@@ -1098,7 +1107,8 @@ async function cleanupSession(sessionId) {
       queueHighWaterMark: session.audioStats.queueHighWaterMark,
       conversationTurns: session.conversationHistory.length / 2,
       reconnectionAttempts: session.reconnectionAttempts,
-      greetingAttempts: session.greetingAttempts
+      greetingAttempts: session.greetingAttempts,
+      outboundChunks: session.outboundChunkCounter - 1
     });
     
     // Remove from active sessions
