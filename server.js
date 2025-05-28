@@ -42,10 +42,18 @@ if (missingEnvVars.length > 0) {
 console.log('✅ Environment variables checked');
 
 // Initialize Supabase client
-const supabase = createClient(
-  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// FIXED: Ensure we're using the REST API URL, not a PostgreSQL connection string
+const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// Validate Supabase URL format
+if (supabaseUrl && supabaseUrl.includes('@')) {
+  console.error('❌ Invalid Supabase URL format. The URL should not contain credentials.');
+  console.error('Please use the REST API URL from your Supabase dashboard (e.g., https://your-project-id.supabase.co)');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Create WebSocket server with explicit path for Twilio streams
 const wss = new WebSocket.Server({ 
@@ -223,6 +231,35 @@ app.get('/debug', (req, res) => {
     </body>
     </html>
   `);
+});
+
+// Groq model list endpoint for debugging
+app.get('/groq-models', async (req, res) => {
+  try {
+    const response = await fetch('https://api.groq.com/openai/v1/models', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      return res.status(response.status).json({
+        error: `Groq API error: ${response.status} ${response.statusText}`,
+        details: errorText
+      });
+    }
+    
+    const models = await response.json();
+    res.json(models);
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to fetch Groq models',
+      message: error.message
+    });
+  }
 });
 
 // WebSocket connection handler
@@ -798,6 +835,7 @@ async function generateAIResponse(transcript, session) {
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
     
     try {
+      // FIXED: Updated to use a widely available model
       const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -805,8 +843,8 @@ async function generateAIResponse(transcript, session) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          // FIXED: Updated to use a currently supported model
-          model: 'llama-3.1-70b', // Changed from 'llama-3.1-70b-versatile' to 'llama-3.1-70b'
+          // FIXED: Changed to a widely available model
+          model: 'llama3-8b-8192', // Changed from 'llama-3.1-70b' to 'llama3-8b-8192'
           messages: [
             {
               role: 'system',
@@ -979,24 +1017,30 @@ async function logConversationTurn(session, userMessage, aiResponse) {
       return false;
     }
     
-    const { error } = await supabase.from('conversation_turns').insert({
-      conversation_id: session.callSid,
-      user_message: userMessage,
-      ai_response: aiResponse,
-      timestamp: new Date().toISOString(),
-      metadata: {
-        tenant_id: session.tenantId,
-        user_id: session.userId,
-        session_id: session.sessionId
+    // FIXED: Ensure we're using the proper Supabase client without credentials in URL
+    try {
+      const { error } = await supabase.from('conversation_turns').insert({
+        conversation_id: session.callSid,
+        user_message: userMessage,
+        ai_response: aiResponse,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          tenant_id: session.tenantId,
+          user_id: session.userId,
+          session_id: session.sessionId
+        }
+      });
+      
+      if (error) {
+        throw error;
       }
-    });
-    
-    if (error) {
-      throw error;
+      
+      console.log('💾 Conversation logged to database');
+      return true;
+    } catch (error) {
+      console.error('❌ Error logging conversation:', error);
+      return false;
     }
-    
-    console.log('💾 Conversation logged to database');
-    return true;
   } catch (error) {
     console.error('❌ Error logging conversation:', error);
     return false;
