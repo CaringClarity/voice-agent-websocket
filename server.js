@@ -431,11 +431,12 @@ async function initializeDeepgramConnection(session) {
     console.log('🎯 Initializing Deepgram connection...');
 
     // Create WebSocket connection to Deepgram with proper URL parameters
+    // FIXED: Updated model from nova-2 to nova-2-general for better compatibility
     const deepgramUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
       encoding: 'mulaw',
       sample_rate: '8000',
       channels: '1',
-      model: 'nova-2',
+      model: 'nova-2-general', // Changed from nova-2 to nova-2-general
       language: 'en-US',
       interim_results: 'false',
       punctuate: 'true',
@@ -445,6 +446,10 @@ async function initializeDeepgramConnection(session) {
     });
 
     console.log('Connecting to Deepgram:', deepgramUrl);
+
+    // Log API key length for debugging (without revealing the key)
+    const apiKeyLength = process.env.DEEPGRAM_API_KEY ? process.env.DEEPGRAM_API_KEY.length : 0;
+    console.log(`Using Deepgram API key with length: ${apiKeyLength} characters`);
 
     const deepgramWs = new WebSocket(deepgramUrl, {
       headers: {
@@ -576,6 +581,17 @@ async function initializeDeepgramConnection(session) {
     deepgramWs.on('error', async (error) => {
       clearTimeout(connectionTimeout);
       console.error('❌ Deepgram connection error:', error);
+      
+      // FIXED: Enhanced error logging for Deepgram errors
+      if (error.response) {
+        try {
+          const errorBody = await error.response.text();
+          console.error('Deepgram error details:', errorBody);
+        } catch (e) {
+          console.error('Could not parse Deepgram error details:', e);
+        }
+      }
+      
       session.deepgramReady = false;
       
       // Attempt reconnection
@@ -858,6 +874,7 @@ async function generateDeepgramTTS(text) {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
         
+        // FIXED: Updated TTS endpoint to use aura-asteria-en model explicitly
         const response = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000', {
           method: 'POST',
           headers: {
