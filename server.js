@@ -1,6 +1,7 @@
 /**
  * Enhanced WebSocket Server for Twilio Voice Assistant
  * With Deepgram TTS for greeting and responses
+ * SIMPLIFIED VERSION WITH OPTIMIZED AUDIO HANDLING
  */
 const express = require('express');
 const http = require('http');
@@ -471,6 +472,7 @@ async function initializeDeepgramConnection(session) {
     }
     
     // Create a new WebSocket connection to Deepgram
+    // UPDATED: Added explicit channels=1 parameter for mono audio
     const deepgramUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&smart_format=true&filler_words=false&interim_results=false&endpointing=500';
     
     session.deepgramConnection = new WebSocket(deepgramUrl, {
@@ -836,7 +838,7 @@ If they express distress or crisis, express empathy and ask if they'd like resou
 }
 
 /**
- * Generate TTS audio using Deepgram
+ * Generate TTS audio using Deepgram with correct format for Twilio
  * @param {string} text - The text to convert to speech
  * @returns {Promise<Buffer|null>} - Audio buffer or null if failed
  */
@@ -854,8 +856,8 @@ async function generateDeepgramTTS(text) {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
         
-        // FIXED: Updated TTS endpoint to use aura-asteria-en model explicitly
-        const response = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000', {
+        // UPDATED: Added explicit channels=1 parameter for mono audio
+        const response = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&channels=1', {
           method: 'POST',
           headers: {
             'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
@@ -903,7 +905,7 @@ async function generateDeepgramTTS(text) {
 }
 
 /**
- * Send audio to Twilio with proper initialization sequence, chunking, and mark events
+ * Send audio to Twilio with correct format and timing
  * @param {Object} session - The session object
  * @param {Buffer} audioBuffer - The audio buffer to send
  * @returns {Promise<boolean>} - True if successful
@@ -924,43 +926,8 @@ async function sendAudioToTwilio(session, audioBuffer) {
     
     console.log(`🔊 Processing audio for Twilio: ${audioBuffer.length} bytes total`);
     
-    // CRITICAL: Send a proper initialization sequence for Twilio Media Streams
-    // This is required before sending any audio data
-    
-    // 1. Send a "clear" mark event to reset any previous audio state
-    const clearMarkName = `clear-${Date.now()}`;
-    const clearMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: clearMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending clear mark: ${clearMarkName}`);
-    session.ws.send(JSON.stringify(clearMarkEvent));
-    
-    // Wait for mark to be processed
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
-    // 2. Send a "start" mark event to initialize audio playback
-    const startMarkName = `start-audio-${Date.now()}`;
-    const startMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: startMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending start mark: ${startMarkName}`);
-    session.ws.send(JSON.stringify(startMarkEvent));
-    
-    // Wait for mark to be processed
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
-    // 3. Break audio into smaller chunks (20ms of audio at 8kHz = 160 bytes)
-    const CHUNK_SIZE = 160;  // 20ms of 8kHz mulaw audio
+    // UPDATED: Use 320 bytes (40ms) chunks instead of 160 bytes
+    const CHUNK_SIZE = 320;  // 40ms of 8kHz mulaw audio
     const chunks = [];
     
     for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
@@ -969,16 +936,13 @@ async function sendAudioToTwilio(session, audioBuffer) {
     
     console.log(`🔊 Split audio into ${chunks.length} chunks of ${CHUNK_SIZE} bytes each`);
     
-    // 4. Send each chunk with proper sequencing and all required fields
+    // SIMPLIFIED: No mark events, just send media chunks with proper timing
     let chunksSent = 0;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const base64Audio = chunk.toString('base64');
       const chunkNumber = session.outboundChunkCounter++;
       const timestamp = Date.now();
-      
-      // Create a unique mark name for this chunk
-      const markName = `chunk-${timestamp}-${chunkNumber}`;
       
       // Send media message with proper format
       const mediaMessage = {
@@ -990,9 +954,6 @@ async function sendAudioToTwilio(session, audioBuffer) {
           timestamp: timestamp,
           payload: base64Audio,
           streamSid: session.streamSid
-        },
-        mark: {
-          name: markName
         }
       };
       
@@ -1000,39 +961,9 @@ async function sendAudioToTwilio(session, audioBuffer) {
       session.ws.send(JSON.stringify(mediaMessage));
       chunksSent++;
       
-      // Add a small delay between chunks to prevent overwhelming Twilio
-      // This is especially important for the first few chunks
-      if (i < 5 || i % 10 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 20));
-      }
+      // UPDATED: Wait exactly 40ms between chunks to match audio timing
+      await new Promise(resolve => setTimeout(resolve, 40));
     }
-    
-    // 5. Send an end mark event to finalize audio playback
-    const endMarkName = `end-audio-${Date.now()}`;
-    const endMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: endMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending end mark: ${endMarkName}`);
-    session.ws.send(JSON.stringify(endMarkEvent));
-    
-    // 6. Send a final "complete" mark to ensure Twilio processes all audio
-    await new Promise(resolve => setTimeout(resolve, 100));
-    const completeMarkName = `complete-${Date.now()}`;
-    const completeMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: completeMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending complete mark: ${completeMarkName}`);
-    session.ws.send(JSON.stringify(completeMarkEvent));
     
     console.log(`🔊 Audio response sent to Twilio: ${chunksSent} chunks sent`);
     return true;
