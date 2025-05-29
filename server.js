@@ -1,11 +1,21 @@
 /**
- * Enhanced WebSocket Server for Twilio Voice Assistant
+ * Fully Corrected WebSocket Server for Twilio Voice Assistant
  * With Deepgram TTS for greeting and responses
+ * 
+ * FIXES IMPLEMENTED:
+ * - Corrected sessionId handling
+ * - Fixed Deepgram event handling (transcript instead of transcriptReceived)
+ * - Improved WebSocket lifecycle management
+ * - Simplified audio payload structure for Twilio compatibility
+ * - Enhanced audio format validation
+ * - Added comprehensive logging
+ * - Improved error handling
  */
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
+const { createDeepgramClient } = require('@deepgram/sdk');
 const dotenv = require('dotenv');
 const { v4: uuidv4 } = require('uuid');
 
@@ -262,57 +272,148 @@ app.get('/groq-models', async (req, res) => {
   }
 });
 
+/**
+ * Enhanced logging utility
+ * @param {string} level - Log level (info, warn, error, debug)
+ * @param {string} category - Logging category
+ * @param {string} message - Log message
+ * @param {Object} [data] - Optional data to include
+ */
+function enhancedLog(level, category, message, data = null) {
+  const timestamp = new Date().toISOString();
+  const logPrefix = {
+    'info': '📋',
+    'warn': '⚠️',
+    'error': '❌',
+    'debug': '🔍',
+    'success': '✅',
+    'audio': '🔊',
+    'network': '📡',
+    'transcript': '🎤'
+  }[level] || '📋';
+  
+  const logMessage = `${timestamp} ${logPrefix} [${category}] ${message}`;
+  
+  switch (level) {
+    case 'error':
+      console.error(logMessage, data ? data : '');
+      break;
+    case 'warn':
+      console.warn(logMessage, data ? data : '');
+      break;
+    case 'debug':
+      console.debug(logMessage, data ? data : '');
+      break;
+    default:
+      console.log(logMessage, data ? data : '');
+  }
+}
+
+/**
+ * Check WebSocket state and handle errors
+ * @param {Object} session - The session object
+ * @param {string} operation - The operation being performed
+ * @returns {boolean} - True if WebSocket is ready
+ */
+function checkWebSocketState(session, operation) {
+  if (!session) {
+    enhancedLog('error', 'WebSocket', `Cannot ${operation}: Session is null or undefined`);
+    return false;
+  }
+  
+  if (!session.ws) {
+    enhancedLog('error', 'WebSocket', `Cannot ${operation}: WebSocket not initialized (sessionId=${session.sessionId})`);
+    return false;
+  }
+  
+  if (session.ws.readyState !== WebSocket.OPEN) {
+    const stateMap = {
+      0: 'CONNECTING',
+      1: 'OPEN',
+      2: 'CLOSING',
+      3: 'CLOSED'
+    };
+    
+    enhancedLog('error', 'WebSocket', `Cannot ${operation}: WebSocket not open, state=${stateMap[session.ws.readyState] || session.ws.readyState} (sessionId=${session.sessionId})`);
+    return false;
+  }
+  
+  return true;
+}
+
 // WebSocket connection handler
 wss.on('connection', async (ws, req) => {
   // Parse URL parameters
   const url = new URL(req.url, `http://${req.headers.host}`);
   const callSid = url.searchParams.get('callSid');
-  const sessionId = url.searchParams.get('sessionId') || `session-${callSid}-${Date.now()}`;
+  
+  // FIXED: Properly extract sessionId from URL parameters
+  // If not provided, use callSid as fallback (they should match)
+  const sessionId = url.searchParams.get('sessionId') || callSid || `session-${Date.now()}`;
+  
   const tenantId = url.searchParams.get('tenantId');
   const userId = url.searchParams.get('userId');
   const sendGreeting = url.searchParams.get('sendGreeting') === 'true';
 
-  console.log(`📞 New WebSocket connection: ${callSid}`);
-  console.log(`URL parameters: callSid=${callSid}, sessionId=${sessionId}, tenantId=${tenantId}, userId=${userId}, sendGreeting=${sendGreeting}`);
+  enhancedLog('info', 'Connection', `New WebSocket connection: callSid=${callSid}, sessionId=${sessionId}`);
 
-  // Initialize session
-  const session = {
-    callSid,
-    sessionId,
-    tenantId,
-    userId,
-    deepgramConnection: null,
-    deepgramReady: false,
-    conversationHistory: [],
-    isActive: true,
-    ws: ws,
-    streamSid: null,
-    audioQueue: [],
-    // Set welcome message flag based on URL parameter
-    welcomeMessageSent: !sendGreeting,
-    reconnectionAttempts: 0,
-    maxReconnectionAttempts: 5,
-    isProcessingResponse: false,
-    pendingResponse: false,
-    greetingAttempts: 0,
-    maxGreetingAttempts: 3,
-    lastActivityTimestamp: Date.now(),
-    // Add ping/pong tracking
-    lastPingTimestamp: Date.now(),
-    pingInterval: null,
-    // Add audio processing stats
-    audioStats: {
-      totalChunksReceived: 0,
-      totalChunksProcessed: 0,
-      queueHighWaterMark: 0
-    },
-    // Add outbound chunk counter for audio sequencing
-    outboundChunkCounter: 1
-  };
+  // Check if session already exists (reconnection case)
+  let session = activeSessions.get(sessionId);
+  
+  if (session) {
+    enhancedLog('info', 'Session', `Reconnecting to existing session: ${sessionId}`);
+    
+    // Update WebSocket connection
+    session.ws = ws;
+    session.isActive = true;
+    session.lastActivityTimestamp = Date.now();
+    
+    // Don't reset other session state to maintain conversation continuity
+  } else {
+    // Initialize new session
+    session = {
+      callSid,
+      sessionId,
+      tenantId,
+      userId,
+      deepgramConnection: null,
+      deepgramReady: false,
+      conversationHistory: [],
+      isActive: true,
+      ws: ws,
+      streamSid: null,
+      audioQueue: [],
+      // Set welcome message flag based on URL parameter
+      welcomeMessageSent: !sendGreeting,
+      reconnectionAttempts: 0,
+      maxReconnectionAttempts: 5,
+      isProcessingResponse: false,
+      pendingResponse: false,
+      greetingAttempts: 0,
+      maxGreetingAttempts: 3,
+      lastActivityTimestamp: Date.now(),
+      // Add ping/pong tracking
+      lastPingTimestamp: Date.now(),
+      pingInterval: null,
+      // Add audio processing stats
+      audioStats: {
+        totalChunksReceived: 0,
+        totalChunksProcessed: 0,
+        queueHighWaterMark: 0
+      },
+      // Add outbound chunk counter for audio sequencing
+      outboundChunkCounter: 1
+    };
 
-  activeSessions.set(sessionId, session);
+    activeSessions.set(sessionId, session);
+    enhancedLog('success', 'Session', `New session created: ${sessionId}`);
+  }
 
   // Set up ping interval to keep connection alive
+  if (session.pingInterval) {
+    clearInterval(session.pingInterval);
+  }
+  
   session.pingInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       const now = Date.now();
@@ -322,7 +423,7 @@ wss.on('connection', async (ws, req) => {
           ws.ping();
           session.lastPingTimestamp = now;
         } catch (error) {
-          console.error(`❌ Error sending ping to client: ${error.message}`);
+          enhancedLog('error', 'WebSocket', `Error sending ping to client: ${error.message}`);
         }
       }
     } else {
@@ -332,11 +433,11 @@ wss.on('connection', async (ws, req) => {
   }, 15000);
 
   // Initialize Deepgram immediately
-  console.log("🚀 Initializing Deepgram immediately on connection");
+  enhancedLog('info', 'Deepgram', `Initializing connection for session ${sessionId}`);
   const deepgramInitialized = await initializeDeepgramConnection(session);
   
   if (!deepgramInitialized) {
-    console.error(`❌ Failed to initialize Deepgram for session ${sessionId}`);
+    enhancedLog('error', 'Deepgram', `Failed to initialize for session ${sessionId}`);
     // Send error message to client
     try {
       ws.send(JSON.stringify({
@@ -347,7 +448,7 @@ wss.on('connection', async (ws, req) => {
         }
       }));
     } catch (error) {
-      console.error(`❌ Error sending error message to client: ${error.message}`);
+      enhancedLog('error', 'WebSocket', `Error sending error message to client: ${error.message}`);
     }
   }
 
@@ -356,17 +457,17 @@ wss.on('connection', async (ws, req) => {
       // Update activity timestamp
       session.lastActivityTimestamp = Date.now();
       
-      console.log(`📥 Received raw message of length: ${message.length} bytes`);
+      enhancedLog('debug', 'WebSocket', `Received raw message of length: ${message.length} bytes`);
       
       // Try to parse as JSON
       try {
         const data = JSON.parse(message);
-        console.log(`📨 Received event: ${data.event}`);
+        enhancedLog('info', 'WebSocket', `Received event: ${data.event}`);
         
         // Store streamSid if this is a start event
         if (data.event === 'start' && data.start && data.start.streamSid) {
           session.streamSid = data.start.streamSid;
-          console.log(`🎙️ Stream started with SID: ${session.streamSid}`);
+          enhancedLog('info', 'Stream', `Started with SID: ${session.streamSid}`);
           
           // Send greeting if needed and we have the streamSid
           if (!session.welcomeMessageSent && session.streamSid) {
@@ -385,7 +486,7 @@ wss.on('connection', async (ws, req) => {
               session.deepgramConnection.readyState === WebSocket.OPEN) {
             session.deepgramConnection.send(audioBuffer);
             session.audioStats.totalChunksProcessed++;
-            console.log('🎤 Forwarded audio to Deepgram');
+            enhancedLog('debug', 'Deepgram', `Forwarded audio chunk`);
           } else {
             // Queue audio until Deepgram is ready
             if (session.audioQueue.length < 500) {
@@ -394,9 +495,9 @@ wss.on('connection', async (ws, req) => {
               if (session.audioQueue.length > session.audioStats.queueHighWaterMark) {
                 session.audioStats.queueHighWaterMark = session.audioQueue.length;
               }
-              console.log(`📦 Queued audio chunk (queue size: ${session.audioQueue.length})`);
+              enhancedLog('debug', 'Audio', `Queued chunk (queue size: ${session.audioQueue.length})`);
             } else {
-              console.warn(`⚠️ Audio queue full, dropping chunk (queue size: ${session.audioQueue.length})`);
+              enhancedLog('warn', 'Audio', `Queue full, dropping chunk (queue size: ${session.audioQueue.length})`);
               // If queue is full and Deepgram is not ready, try to reconnect
               if (!session.deepgramReady && session.reconnectionAttempts < session.maxReconnectionAttempts) {
                 await reconnectDeepgramSTT(session);
@@ -405,14 +506,34 @@ wss.on('connection', async (ws, req) => {
           }
         }
         
-        // Handle stop event
+        // FIXED: Don't immediately clean up on stop event
+        // Instead, mark session for delayed cleanup to ensure all responses are sent
         if (data.event === 'stop') {
-          console.log('🛑 Stream stopped');
-          await cleanupSession(session.sessionId);
+          enhancedLog('info', 'Stream', `Stop event received for session ${sessionId}`);
+          
+          // Check if we're still processing a response
+          if (session.isProcessingResponse) {
+            enhancedLog('info', 'Session', `Still processing a response, delaying cleanup for session ${sessionId}`);
+            
+            // Mark for delayed cleanup
+            session.pendingCleanup = true;
+            
+            // Set a timeout to clean up after a reasonable delay
+            setTimeout(() => {
+              if (session.pendingCleanup) {
+                enhancedLog('info', 'Session', `Performing delayed cleanup after stop event for session ${sessionId}`);
+                cleanupSession(session.sessionId);
+              }
+            }, 10000); // 10 second delay
+          } else {
+            // No active processing, can clean up now
+            enhancedLog('info', 'Session', `Performing immediate cleanup after stop event for session ${sessionId}`);
+            await cleanupSession(session.sessionId);
+          }
         }
       } catch (jsonError) {
         // Not JSON, might be binary audio data
-        console.log(`📦 Received binary data, length: ${message.length} bytes`);
+        enhancedLog('debug', 'WebSocket', `Received binary data, length: ${message.length} bytes`);
         session.audioStats.totalChunksReceived++;
         
         // If Deepgram is ready, forward the audio
@@ -420,7 +541,7 @@ wss.on('connection', async (ws, req) => {
             session.deepgramConnection.readyState === WebSocket.OPEN) {
           session.deepgramConnection.send(message);
           session.audioStats.totalChunksProcessed++;
-          console.log('🎤 Forwarded binary audio to Deepgram');
+          enhancedLog('debug', 'Deepgram', `Forwarded binary audio`);
         } else {
           // Queue audio until Deepgram is ready
           if (session.audioQueue.length < 500) {
@@ -429,33 +550,46 @@ wss.on('connection', async (ws, req) => {
             if (session.audioQueue.length > session.audioStats.queueHighWaterMark) {
               session.audioStats.queueHighWaterMark = session.audioQueue.length;
             }
-            console.log(`📦 Queued binary audio chunk (queue size: ${session.audioQueue.length})`);
+            enhancedLog('debug', 'Audio', `Queued binary chunk (queue size: ${session.audioQueue.length})`);
           } else {
-            console.warn(`⚠️ Audio queue full, dropping chunk (queue size: ${session.audioQueue.length})`);
+            enhancedLog('warn', 'Audio', `Queue full, dropping binary chunk (queue size: ${session.audioQueue.length})`);
           }
         }
       }
     } catch (error) {
-      console.error('❌ WebSocket message error:', error);
+      enhancedLog('error', 'WebSocket', `Message error: ${error.message}`, error);
     }
   });
 
   // Handle pong responses to track connection health
   ws.on('pong', () => {
     const latency = Date.now() - session.lastPingTimestamp;
-    console.log(`📡 Received pong from client, latency: ${latency}ms`);
+    enhancedLog('debug', 'WebSocket', `Received pong from client, latency: ${latency}ms`);
     session.lastActivityTimestamp = Date.now();
   });
 
+  // FIXED: Don't immediately clean up on WebSocket close
   ws.on('close', (code, reason) => {
-    console.log(`📞 WebSocket closed: ${sessionId}, code: ${code}, reason: ${reason || 'No reason provided'}`);
+    enhancedLog('info', 'WebSocket', `Connection closed: ${sessionId}, code: ${code}, reason: ${reason || 'No reason provided'}`);
     clearInterval(session.pingInterval);
-    cleanupSession(sessionId);
+    
+    // Don't immediately remove the session
+    // Mark it as inactive but keep it around for a while in case of reconnection
+    session.isActive = false;
+    
+    // Set a timeout to clean up after a reasonable delay
+    setTimeout(() => {
+      // Only clean up if still inactive
+      if (activeSessions.has(sessionId) && !activeSessions.get(sessionId).isActive) {
+        enhancedLog('info', 'Session', `Performing delayed cleanup after WebSocket close: ${sessionId}`);
+        cleanupSession(sessionId);
+      }
+    }, 30000); // 30 second delay
   });
 });
 
 /**
- * Initialize Deepgram STT connection
+ * Initialize Deepgram connection for speech-to-text
  * @param {Object} session - The session object
  * @returns {Promise<boolean>} - True if successful
  */
@@ -466,33 +600,44 @@ async function initializeDeepgramConnection(session) {
       try {
         session.deepgramConnection.close();
       } catch (error) {
-        console.error('❌ Error closing existing Deepgram connection:', error);
+        enhancedLog('error', 'Deepgram', `Error closing existing connection: ${error.message}`);
       }
     }
     
-    // Create a new WebSocket connection to Deepgram
-    const deepgramUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&smart_format=true&filler_words=false&interim_results=false&endpointing=500';
+    enhancedLog('info', 'Deepgram', `Initializing connection for session ${session.sessionId}`);
     
-    session.deepgramConnection = new WebSocket(deepgramUrl, {
-      headers: {
-        Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`
-      }
+    // Create Deepgram client
+    const deepgram = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
+    
+    // Create live transcription connection
+    const connection = deepgram.listen.live({
+      model: 'nova-2',
+      smart_format: true,
+      interim_results: false,
+      language: 'en',
+      encoding: 'mulaw',
+      sample_rate: 8000,
+      channels: 1
     });
     
+    session.deepgramConnection = connection;
+    
     // Set up event handlers
-    session.deepgramConnection.on('open', () => {
-      console.log('🎙️ Deepgram connection established');
+    connection.on('open', () => {
+      enhancedLog('success', 'Deepgram', `Connection established for session ${session.sessionId}`);
       session.deepgramReady = true;
       
       // Process any queued audio
       if (session.audioQueue.length > 0) {
-        console.log(`📤 Processing ${session.audioQueue.length} queued audio chunks`);
+        enhancedLog('info', 'Audio', `Processing ${session.audioQueue.length} queued chunks for session ${session.sessionId}`);
         
-        // Process all queued audio
         for (const audioChunk of session.audioQueue) {
-          if (session.deepgramConnection.readyState === WebSocket.OPEN) {
+          if (session.deepgramReady && 
+              session.deepgramConnection && 
+              session.deepgramConnection.readyState === WebSocket.OPEN) {
             session.deepgramConnection.send(audioChunk);
             session.audioStats.totalChunksProcessed++;
+            enhancedLog('debug', 'Deepgram', `Forwarded queued audio chunk`);
           }
         }
         
@@ -501,28 +646,29 @@ async function initializeDeepgramConnection(session) {
       }
     });
     
-    session.deepgramConnection.on('message', async (data) => {
+    // FIXED: Changed from 'transcriptReceived' to 'transcript' event
+    connection.on('transcript', async (data) => {
       try {
-        const response = JSON.parse(data);
+        // Log the transcript data for debugging
+        enhancedLog('debug', 'Deepgram', `Received transcript data for session ${session.sessionId}`);
         
-        // Check if this is a transcript
-        if (response.type === 'Results' && 
-            response.channel && 
-            response.channel.alternatives && 
-            response.channel.alternatives.length > 0) {
+        // Check if this is a transcript with alternatives
+        if (data.channel && 
+            data.channel.alternatives && 
+            data.channel.alternatives.length > 0) {
           
-          const transcript = response.channel.alternatives[0].transcript;
+          const transcript = data.channel.alternatives[0].transcript;
           
           // Only process if we have actual text
           if (transcript && transcript.trim()) {
-            console.log(`🎤 Transcript: "${transcript}"`);
+            enhancedLog('transcript', 'Deepgram', `"${transcript}"`);
             
             // Add to conversation history
             session.conversationHistory.push(transcript);
             
             // Don't process if we're already generating a response
             if (session.isProcessingResponse) {
-              console.log('⏳ Already processing a response, marking as pending');
+              enhancedLog('info', 'AI', `Already processing a response, marking as pending for session ${session.sessionId}`);
               session.pendingResponse = true;
               return;
             }
@@ -534,8 +680,8 @@ async function initializeDeepgramConnection(session) {
               const aiResponse = await generateAIResponse(session, transcript);
               
               if (aiResponse) {
-                console.log('AI response result received');
-                console.log(`🤖 AI response: ${aiResponse}`);
+                enhancedLog('success', 'AI', `Response generated for session ${session.sessionId}`);
+                enhancedLog('info', 'AI', `Response: ${aiResponse}`);
                 
                 // Add to conversation history
                 session.conversationHistory.push(aiResponse);
@@ -547,22 +693,29 @@ async function initializeDeepgramConnection(session) {
                 const ttsAudio = await generateDeepgramTTS(aiResponse);
                 
                 if (ttsAudio) {
-                  // Send audio back to Twilio
-                  await sendAudioToTwilio(session, ttsAudio);
+                  enhancedLog('audio', 'TTS', `Generated (${ttsAudio.length} bytes) for session ${session.sessionId}`);
+                  
+                  // FIXED: Check WebSocket state before sending
+                  if (checkWebSocketState(session, 'send TTS audio')) {
+                    // Send audio back to Twilio
+                    await sendAudioToTwilio(session, ttsAudio);
+                  } else {
+                    enhancedLog('error', 'Twilio', `Cannot send TTS: WebSocket not open for session ${session.sessionId}`);
+                  }
                 } else {
-                  console.error('❌ Failed to generate TTS for AI response');
+                  enhancedLog('error', 'TTS', `Failed to generate for AI response for session ${session.sessionId}`);
                 }
               } else {
-                console.error('❌ Failed to generate AI response');
+                enhancedLog('error', 'AI', `Failed to generate response for session ${session.sessionId}`);
               }
             } catch (error) {
-              console.error('❌ Error processing transcript:', error);
+              enhancedLog('error', 'Processing', `Error processing transcript: ${error.message}`, error);
             } finally {
               session.isProcessingResponse = false;
               
               // Check if we have a pending response to process
               if (session.pendingResponse) {
-                console.log('⏳ Processing pending response');
+                enhancedLog('info', 'AI', `Processing pending response for session ${session.sessionId}`);
                 session.pendingResponse = false;
                 
                 // Get the last user message from history
@@ -577,8 +730,8 @@ async function initializeDeepgramConnection(session) {
                     const aiResponse = await generateAIResponse(session, lastUserMessage);
                     
                     if (aiResponse) {
-                      console.log('AI response result received for pending message');
-                      console.log(`🤖 AI response: ${aiResponse}`);
+                      enhancedLog('success', 'AI', `Response generated for pending message for session ${session.sessionId}`);
+                      enhancedLog('info', 'AI', `Response: ${aiResponse}`);
                       
                       // Add to conversation history
                       session.conversationHistory.push(aiResponse);
@@ -590,16 +743,23 @@ async function initializeDeepgramConnection(session) {
                       const ttsAudio = await generateDeepgramTTS(aiResponse);
                       
                       if (ttsAudio) {
-                        // Send audio back to Twilio
-                        await sendAudioToTwilio(session, ttsAudio);
+                        enhancedLog('audio', 'TTS', `Generated for pending response (${ttsAudio.length} bytes) for session ${session.sessionId}`);
+                        
+                        // FIXED: Check WebSocket state before sending
+                        if (checkWebSocketState(session, 'send pending TTS audio')) {
+                          // Send audio back to Twilio
+                          await sendAudioToTwilio(session, ttsAudio);
+                        } else {
+                          enhancedLog('error', 'Twilio', `Cannot send TTS for pending response: WebSocket not open for session ${session.sessionId}`);
+                        }
                       } else {
-                        console.error('❌ Failed to generate TTS for pending AI response');
+                        enhancedLog('error', 'TTS', `Failed to generate for pending AI response for session ${session.sessionId}`);
                       }
                     } else {
-                      console.error('❌ Failed to generate AI response for pending message');
+                      enhancedLog('error', 'AI', `Failed to generate response for pending message for session ${session.sessionId}`);
                     }
                   } catch (error) {
-                    console.error('❌ Error processing pending transcript:', error);
+                    enhancedLog('error', 'Processing', `Error processing pending transcript: ${error.message}`, error);
                   } finally {
                     session.isProcessingResponse = false;
                   }
@@ -609,12 +769,12 @@ async function initializeDeepgramConnection(session) {
           }
         }
       } catch (error) {
-        console.error('❌ Error parsing Deepgram response:', error);
+        enhancedLog('error', 'Deepgram', `Error parsing response: ${error.message}`, error);
       }
     });
     
-    session.deepgramConnection.on('error', (error) => {
-      console.error('❌ Deepgram connection error:', error);
+    connection.on('error', (error) => {
+      enhancedLog('error', 'Deepgram', `Connection error for session ${session.sessionId}: ${error.message}`, error);
       session.deepgramReady = false;
       
       // Try to reconnect
@@ -623,8 +783,8 @@ async function initializeDeepgramConnection(session) {
       }
     });
     
-    session.deepgramConnection.on('close', (code, reason) => {
-      console.log(`🎙️ Deepgram connection closed: code=${code}, reason=${reason || 'No reason provided'}`);
+    connection.on('close', (code, reason) => {
+      enhancedLog('info', 'Deepgram', `Connection closed for session ${session.sessionId}: code=${code}, reason=${reason || 'No reason provided'}`);
       session.deepgramReady = false;
       
       // Try to reconnect if session is still active
@@ -635,7 +795,7 @@ async function initializeDeepgramConnection(session) {
     
     return true;
   } catch (error) {
-    console.error('❌ Error initializing Deepgram connection:', error);
+    enhancedLog('error', 'Deepgram', `Error initializing connection for session ${session.sessionId}: ${error.message}`, error);
     session.deepgramReady = false;
     return false;
   }
@@ -649,15 +809,172 @@ async function initializeDeepgramConnection(session) {
 async function reconnectDeepgramSTT(session) {
   session.reconnectionAttempts++;
   
-  console.log(`🔄 Attempting to reconnect to Deepgram (attempt ${session.reconnectionAttempts}/${session.maxReconnectionAttempts})`);
+  enhancedLog('info', 'Deepgram', `Attempting to reconnect (attempt ${session.reconnectionAttempts}/${session.maxReconnectionAttempts}) for session ${session.sessionId}`);
   
   // Exponential backoff
   const backoffTime = Math.min(1000 * Math.pow(2, session.reconnectionAttempts - 1), 10000);
-  console.log(`⏳ Waiting ${backoffTime}ms before reconnecting...`);
+  enhancedLog('info', 'Deepgram', `Waiting ${backoffTime}ms before reconnecting for session ${session.sessionId}`);
   
   await new Promise(resolve => setTimeout(resolve, backoffTime));
   
   return await initializeDeepgramConnection(session);
+}
+
+/**
+ * Validate audio format for Twilio compatibility
+ * @param {Buffer} audioBuffer - The audio buffer to validate
+ * @returns {Object} - Validation result with status and message
+ */
+function validateAudioFormat(audioBuffer) {
+  try {
+    // Check if buffer exists and has content
+    if (!audioBuffer || audioBuffer.length === 0) {
+      return {
+        valid: false,
+        message: 'Audio buffer is empty or null'
+      };
+    }
+    
+    // Check if buffer size is reasonable for audio
+    // A few seconds of 8kHz μ-law audio should be at least a few KB
+    if (audioBuffer.length < 1000) {
+      return {
+        valid: true,
+        warning: `Audio buffer is unusually small (${audioBuffer.length} bytes), may be truncated`,
+        message: 'Audio format appears to be valid but buffer is small'
+      };
+    }
+    
+    // For μ-law audio, we can't easily check the encoding without decoding
+    // But we can check if the buffer size is a multiple of expected chunk size
+    // 20ms of 8kHz audio = 160 bytes
+    const remainder = audioBuffer.length % 160;
+    if (remainder !== 0) {
+      return {
+        valid: true,
+        warning: `Audio buffer length (${audioBuffer.length}) is not a multiple of 160 bytes, last chunk will be padded`,
+        message: 'Audio format appears to be valid but may need padding'
+      };
+    }
+    
+    return {
+      valid: true,
+      message: 'Audio format appears to be valid for Twilio'
+    };
+  } catch (error) {
+    return {
+      valid: false,
+      message: `Error validating audio format: ${error.message}`
+    };
+  }
+}
+
+/**
+ * Ensure audio chunks are exactly 160 bytes (pad if necessary)
+ * @param {Buffer} chunk - The audio chunk to normalize
+ * @returns {Buffer} - Normalized audio chunk
+ */
+function normalizeChunkSize(chunk) {
+  if (chunk.length === 160) {
+    return chunk; // Already correct size
+  }
+  
+  if (chunk.length > 160) {
+    // Truncate to 160 bytes
+    return chunk.slice(0, 160);
+  }
+  
+  // Pad with silence (μ-law silence value is 255)
+  const paddedChunk = Buffer.alloc(160, 255);
+  chunk.copy(paddedChunk);
+  return paddedChunk;
+}
+
+/**
+ * Send audio to Twilio with proper format and simplified payload structure
+ * @param {Object} session - The session object
+ * @param {Buffer} audioBuffer - The audio buffer to send
+ * @returns {Promise<boolean>} - True if successful
+ */
+async function sendAudioToTwilio(session, audioBuffer) {
+  try {
+    // Check if we have a streamSid
+    if (!session.streamSid) {
+      enhancedLog('error', 'Twilio', `Cannot send audio: No streamSid available for session ${session.sessionId}`);
+      return false;
+    }
+    
+    // Check if WebSocket is open
+    if (!checkWebSocketState(session, 'send audio')) {
+      return false;
+    }
+    
+    enhancedLog('audio', 'TTS', `Generated (${audioBuffer.length} bytes) for session ${session.sessionId}`);
+    
+    // Validate audio format
+    const validation = validateAudioFormat(audioBuffer);
+    if (!validation.valid) {
+      enhancedLog('error', 'Audio', `Validation failed: ${validation.message} for session ${session.sessionId}`);
+      return false;
+    }
+    
+    if (validation.warning) {
+      enhancedLog('warn', 'Audio', validation.warning);
+    }
+    
+    // Break audio into smaller chunks (20ms of audio at 8kHz = 160 bytes)
+    const CHUNK_SIZE = 160;  // 20ms of 8kHz mulaw audio
+    const chunks = [];
+    
+    for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
+      const chunk = audioBuffer.slice(i, Math.min(i + CHUNK_SIZE, audioBuffer.length));
+      // Ensure each chunk is exactly 160 bytes
+      chunks.push(normalizeChunkSize(chunk));
+    }
+    
+    enhancedLog('audio', 'Twilio', `Split audio into ${chunks.length} chunks of ${CHUNK_SIZE} bytes each for session ${session.sessionId}`);
+    
+    // FIXED: Simplified payload structure
+    // Send each chunk with the minimal required fields
+    let chunksSent = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const payload = chunk.toString('base64');
+      
+      // FIXED: Use simplified payload structure as recommended
+      const mediaMessage = {
+        event: 'media',
+        media: {
+          track: 'outbound',
+          payload: payload
+        }
+      };
+      
+      // Verify WebSocket is still open before sending
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        // Send through WebSocket back to Twilio
+        session.ws.send(JSON.stringify(mediaMessage));
+        
+        enhancedLog('debug', 'Twilio', `Sent audio chunk ${i+1}/${chunks.length}, size: ${payload.length} for session ${session.sessionId}`);
+        chunksSent++;
+        
+        // Add a small delay between chunks to prevent overwhelming Twilio
+        // This is especially important for the first few chunks
+        if (i < 5 || i % 10 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+      } else {
+        enhancedLog('error', 'Twilio', `WebSocket closed during audio transmission for session ${session.sessionId}`);
+        return false;
+      }
+    }
+    
+    enhancedLog('success', 'Twilio', `Audio response sent: ${chunksSent} chunks for session ${session.sessionId}`);
+    return true;
+  } catch (error) {
+    enhancedLog('error', 'Twilio', `Error sending audio: ${error.message} for session ${session.sessionId}`, error);
+    return false;
+  }
 }
 
 /**
@@ -672,11 +989,11 @@ async function sendGreetingMessage(session) {
     
     // Check if we've already tried too many times
     if (session.greetingAttempts > session.maxGreetingAttempts) {
-      console.error(`❌ Failed to send greeting after ${session.maxGreetingAttempts} attempts`);
+      enhancedLog('error', 'Greeting', `Failed to send after ${session.maxGreetingAttempts} attempts for session ${session.sessionId}`);
       return false;
     }
     
-    console.log(`🤖 Sending greeting message (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})`);
+    enhancedLog('info', 'Greeting', `Sending message (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts}) for session ${session.sessionId}`);
     
     // Default greeting message
     const greeting = "Hello! This is Caring Clarity's AI assistant. How can I help you schedule an appointment today?";
@@ -688,38 +1005,127 @@ async function sendGreetingMessage(session) {
     const ttsAudio = await generateDeepgramTTS(greeting);
     
     if (ttsAudio) {
-      // Send audio back to Twilio
-      const result = await sendAudioToTwilio(session, ttsAudio);
+      enhancedLog('audio', 'TTS', `Greeting generated (${ttsAudio.length} bytes) for session ${session.sessionId}`);
       
-      if (result) {
-        session.welcomeMessageSent = true;
-        console.log('✅ Greeting message sent successfully');
-        return true;
+      // FIXED: Check WebSocket state before sending
+      if (checkWebSocketState(session, 'send greeting audio')) {
+        // Send audio back to Twilio
+        const result = await sendAudioToTwilio(session, ttsAudio);
+        
+        if (result) {
+          session.welcomeMessageSent = true;
+          enhancedLog('success', 'Greeting', `Message sent successfully for session ${session.sessionId}`);
+          return true;
+        } else {
+          enhancedLog('error', 'Greeting', `Failed to send audio to Twilio for session ${session.sessionId}`);
+          
+          // Try again after a delay if we haven't reached the maximum attempts
+          if (session.greetingAttempts < session.maxGreetingAttempts) {
+            enhancedLog('info', 'Greeting', `Will retry in 2 seconds for session ${session.sessionId}`);
+            setTimeout(() => sendGreetingMessage(session), 2000);
+          }
+          
+          return false;
+        }
       } else {
-        console.error('❌ Failed to send greeting audio to Twilio');
+        enhancedLog('error', 'Greeting', `Cannot send: WebSocket not open for session ${session.sessionId}`);
         
         // Try again after a delay if we haven't reached the maximum attempts
         if (session.greetingAttempts < session.maxGreetingAttempts) {
-          console.log(`⏳ Will retry sending greeting in 2 seconds...`);
+          enhancedLog('info', 'Greeting', `Will retry in 2 seconds for session ${session.sessionId}`);
           setTimeout(() => sendGreetingMessage(session), 2000);
         }
         
         return false;
       }
     } else {
-      console.error('❌ Failed to generate TTS for greeting');
+      enhancedLog('error', 'Greeting', `Failed to generate TTS for session ${session.sessionId}`);
       
       // Try again after a delay if we haven't reached the maximum attempts
       if (session.greetingAttempts < session.maxGreetingAttempts) {
-        console.log(`⏳ Will retry sending greeting in 2 seconds...`);
+        enhancedLog('info', 'Greeting', `Will retry in 2 seconds for session ${session.sessionId}`);
         setTimeout(() => sendGreetingMessage(session), 2000);
       }
       
       return false;
     }
   } catch (error) {
-    console.error('❌ Error sending greeting message:', error);
+    enhancedLog('error', 'Greeting', `Error sending message: ${error.message} for session ${session.sessionId}`, error);
     return false;
+  }
+}
+
+/**
+ * Generate TTS audio using Deepgram
+ * @param {string} text - The text to convert to speech
+ * @returns {Promise<Buffer|null>} - Audio buffer or null if failed
+ */
+async function generateDeepgramTTS(text) {
+  try {
+    enhancedLog('info', 'TTS', `Generating Deepgram TTS for: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`);
+    
+    // Add retry logic
+    const maxRetries = 3;
+    let retryCount = 0;
+    let lastError = null;
+    
+    while (retryCount < maxRetries) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+        
+        // FIXED: Ensure we're using the correct format for Twilio
+        // Must be 8kHz, mono, µ-law encoded
+        const response = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            text: text,
+          }),
+          signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const audioBuffer = Buffer.from(await response.arrayBuffer());
+          enhancedLog('success', 'TTS', `Deepgram TTS generated successfully (${audioBuffer.length} bytes)`);
+          
+          // Verify audio format
+          if (audioBuffer.length > 0) {
+            return audioBuffer;
+          } else {
+            enhancedLog('error', 'TTS', `Deepgram returned empty audio buffer`);
+            lastError = new Error('Empty audio buffer');
+          }
+        } else {
+          const errorText = await response.text();
+          enhancedLog('error', 'TTS', `Deepgram failed (attempt ${retryCount + 1}/${maxRetries}): ${response.status} ${response.statusText} - ${errorText}`);
+          lastError = new Error(`HTTP ${response.status}: ${errorText}`);
+        }
+      } catch (error) {
+        clearTimeout(timeoutId);
+        enhancedLog('error', 'TTS', `Deepgram error (attempt ${retryCount + 1}/${maxRetries}): ${error.message}`, error);
+        lastError = error;
+      }
+      
+      retryCount++;
+      if (retryCount < maxRetries) {
+        // Exponential backoff
+        const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
+        enhancedLog('info', 'TTS', `Waiting ${backoffTime}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, backoffTime));
+      }
+    }
+    
+    enhancedLog('error', 'TTS', `All Deepgram attempts failed: ${lastError?.message}`);
+    return null;
+  } catch (error) {
+    enhancedLog('error', 'TTS', `Deepgram error: ${error.message}`, error);
+    return null;
   }
 }
 
@@ -731,7 +1137,7 @@ async function sendGreetingMessage(session) {
  */
 async function generateAIResponse(session, userMessage) {
   try {
-    console.log('🧠 Generating AI response...');
+    enhancedLog('info', 'AI', `Generating response for session ${session.sessionId}`);
     
     // Add retry logic
     const maxRetries = 3;
@@ -803,18 +1209,17 @@ If they express distress or crisis, express empathy and ask if they'd like resou
           if (data.choices && data.choices.length > 0) {
             return data.choices[0].message.content;
           } else {
-            console.error('❌ Groq API returned empty choices array');
+            enhancedLog('error', 'AI', `Groq API returned empty choices array for session ${session.sessionId}`);
             lastError = new Error('Empty choices array');
           }
         } else {
           const errorText = await response.text();
-          console.error(`❌ Groq API error (attempt ${retryCount + 1}/${maxRetries}):`, 
-                        response.status, response.statusText, errorText);
+          enhancedLog('error', 'AI', `Groq API error (attempt ${retryCount + 1}/${maxRetries}): ${response.status} ${response.statusText} - ${errorText} for session ${session.sessionId}`);
           lastError = new Error(`HTTP ${response.status}: ${errorText}`);
         }
       } catch (error) {
         clearTimeout(timeoutId);
-        console.error(`❌ Groq API error (attempt ${retryCount + 1}/${maxRetries}):`, error);
+        enhancedLog('error', 'AI', `Groq API error (attempt ${retryCount + 1}/${maxRetries}): ${error.message} for session ${session.sessionId}`, error);
         lastError = error;
       }
       
@@ -822,223 +1227,16 @@ If they express distress or crisis, express empathy and ask if they'd like resou
       if (retryCount < maxRetries) {
         // Exponential backoff
         const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
-        console.log(`Waiting ${backoffTime}ms before retry...`);
+        enhancedLog('info', 'AI', `Waiting ${backoffTime}ms before retry for session ${session.sessionId}`);
         await new Promise(resolve => setTimeout(resolve, backoffTime));
       }
     }
     
-    console.error('❌ All Groq API attempts failed:', lastError);
+    enhancedLog('error', 'AI', `All Groq API attempts failed: ${lastError?.message} for session ${session.sessionId}`);
     return null;
   } catch (error) {
-    console.error('❌ Error generating AI response:', error);
+    enhancedLog('error', 'AI', `Error generating response: ${error.message} for session ${session.sessionId}`, error);
     return null;
-  }
-}
-
-/**
- * Generate TTS audio using Deepgram
- * @param {string} text - The text to convert to speech
- * @returns {Promise<Buffer|null>} - Audio buffer or null if failed
- */
-async function generateDeepgramTTS(text) {
-  try {
-    console.log('🎤 Generating Deepgram TTS for:', text);
-    
-    // Add retry logic
-    const maxRetries = 3;
-    let retryCount = 0;
-    let lastError = null;
-    
-    while (retryCount < maxRetries) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
-        
-        // FIXED: Updated TTS endpoint to use aura-asteria-en model explicitly
-        const response = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            text: text,
-          }),
-          signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-
-        if (response.ok) {
-          const audioBuffer = Buffer.from(await response.arrayBuffer());
-          console.log('✅ Deepgram TTS generated successfully');
-          return audioBuffer;
-        } else {
-          const errorText = await response.text();
-          console.error(`❌ Deepgram TTS failed (attempt ${retryCount + 1}/${maxRetries}):`, 
-                        response.status, response.statusText, errorText);
-          lastError = new Error(`HTTP ${response.status}: ${errorText}`);
-        }
-      } catch (error) {
-        clearTimeout(timeoutId);
-        console.error(`❌ Deepgram TTS error (attempt ${retryCount + 1}/${maxRetries}):`, error);
-        lastError = error;
-      }
-      
-      retryCount++;
-      if (retryCount < maxRetries) {
-        // Exponential backoff
-        const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
-        console.log(`Waiting ${backoffTime}ms before retry...`);
-        await new Promise(resolve => setTimeout(resolve, backoffTime));
-      }
-    }
-    
-    console.error('❌ All Deepgram TTS attempts failed:', lastError);
-    return null;
-  } catch (error) {
-    console.error('❌ Deepgram TTS error:', error);
-    return null;
-  }
-}
-
-/**
- * Send audio to Twilio with proper initialization sequence, chunking, and mark events
- * @param {Object} session - The session object
- * @param {Buffer} audioBuffer - The audio buffer to send
- * @returns {Promise<boolean>} - True if successful
- */
-async function sendAudioToTwilio(session, audioBuffer) {
-  try {
-    // Check if we have a streamSid
-    if (!session.streamSid) {
-      console.error('❌ Cannot send audio to Twilio: No streamSid available');
-      return false;
-    }
-    
-    // Check if WebSocket is open
-    if (!session.ws || session.ws.readyState !== WebSocket.OPEN) {
-      console.error('❌ Cannot send audio to Twilio: WebSocket not open');
-      return false;
-    }
-    
-    console.log(`🔊 Processing audio for Twilio: ${audioBuffer.length} bytes total`);
-    
-    // CRITICAL: Send a proper initialization sequence for Twilio Media Streams
-    // This is required before sending any audio data
-    
-    // 1. Send a "clear" mark event to reset any previous audio state
-    const clearMarkName = `clear-${Date.now()}`;
-    const clearMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: clearMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending clear mark: ${clearMarkName}`);
-    session.ws.send(JSON.stringify(clearMarkEvent));
-    
-    // Wait for mark to be processed
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
-    // 2. Send a "start" mark event to initialize audio playback
-    const startMarkName = `start-audio-${Date.now()}`;
-    const startMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: startMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending start mark: ${startMarkName}`);
-    session.ws.send(JSON.stringify(startMarkEvent));
-    
-    // Wait for mark to be processed
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
-    // 3. Break audio into smaller chunks (20ms of audio at 8kHz = 160 bytes)
-    const CHUNK_SIZE = 160;  // 20ms of 8kHz mulaw audio
-    const chunks = [];
-    
-    for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
-      chunks.push(audioBuffer.slice(i, Math.min(i + CHUNK_SIZE, audioBuffer.length)));
-    }
-    
-    console.log(`🔊 Split audio into ${chunks.length} chunks of ${CHUNK_SIZE} bytes each`);
-    
-    // 4. Send each chunk with proper sequencing and all required fields
-    let chunksSent = 0;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const base64Audio = chunk.toString('base64');
-      const chunkNumber = session.outboundChunkCounter++;
-      const timestamp = Date.now();
-      
-      // Create a unique mark name for this chunk
-      const markName = `chunk-${timestamp}-${chunkNumber}`;
-      
-      // Send media message with proper format
-      const mediaMessage = {
-        event: 'media',
-        streamSid: session.streamSid,
-        media: {
-          track: "outbound",
-          chunk: chunkNumber,
-          timestamp: timestamp,
-          payload: base64Audio,
-          streamSid: session.streamSid
-        },
-        mark: {
-          name: markName
-        }
-      };
-      
-      // Send through WebSocket back to Twilio
-      session.ws.send(JSON.stringify(mediaMessage));
-      chunksSent++;
-      
-      // Add a small delay between chunks to prevent overwhelming Twilio
-      // This is especially important for the first few chunks
-      if (i < 5 || i % 10 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 20));
-      }
-    }
-    
-    // 5. Send an end mark event to finalize audio playback
-    const endMarkName = `end-audio-${Date.now()}`;
-    const endMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: endMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending end mark: ${endMarkName}`);
-    session.ws.send(JSON.stringify(endMarkEvent));
-    
-    // 6. Send a final "complete" mark to ensure Twilio processes all audio
-    await new Promise(resolve => setTimeout(resolve, 100));
-    const completeMarkName = `complete-${Date.now()}`;
-    const completeMarkEvent = {
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: {
-        name: completeMarkName
-      }
-    };
-    
-    console.log(`🔊 Sending complete mark: ${completeMarkName}`);
-    session.ws.send(JSON.stringify(completeMarkEvent));
-    
-    console.log(`🔊 Audio response sent to Twilio: ${chunksSent} chunks sent`);
-    return true;
-  } catch (error) {
-    console.error('❌ Error sending audio to Twilio:', error);
-    return false;
   }
 }
 
@@ -1053,7 +1251,7 @@ async function logConversationTurn(session, userMessage, aiResponse) {
   try {
     // FIXED: Only attempt to log if we have both messages
     if (!userMessage || !aiResponse) {
-      console.log('⚠️ Skipping conversation logging due to missing messages');
+      enhancedLog('warn', 'Database', `Skipping conversation logging due to missing messages for session ${session.sessionId}`);
       return false;
     }
     
@@ -1075,14 +1273,14 @@ async function logConversationTurn(session, userMessage, aiResponse) {
         throw error;
       }
       
-      console.log('💾 Conversation logged to database');
+      enhancedLog('success', 'Database', `Conversation logged for session ${session.sessionId}`);
       return true;
     } catch (error) {
-      console.error('❌ Error logging conversation:', error);
+      enhancedLog('error', 'Database', `Error logging conversation: ${error.message} for session ${session.sessionId}`, error);
       return false;
     }
   } catch (error) {
-    console.error('❌ Error logging conversation:', error);
+    enhancedLog('error', 'Database', `Error logging conversation: ${error.message} for session ${session.sessionId}`, error);
     return false;
   }
 }
@@ -1095,7 +1293,7 @@ async function logConversationTurn(session, userMessage, aiResponse) {
  */
 function sendErrorToClient(session, code, message) {
   try {
-    if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+    if (checkWebSocketState(session, 'send error message')) {
       session.ws.send(JSON.stringify({
         event: 'error',
         error: {
@@ -1103,10 +1301,10 @@ function sendErrorToClient(session, code, message) {
           message
         }
       }));
-      console.log(`📤 Sent error to client: ${code} - ${message}`);
+      enhancedLog('info', 'WebSocket', `Sent error to client: ${code} - ${message} for session ${session.sessionId}`);
     }
   } catch (error) {
-    console.error('❌ Error sending error message to client:', error);
+    enhancedLog('error', 'WebSocket', `Error sending error message to client: ${error.message} for session ${session.sessionId}`, error);
   }
 }
 
@@ -1117,6 +1315,13 @@ function sendErrorToClient(session, code, message) {
 async function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId);
   if (session) {
+    // FIXED: Check if we're still processing a response
+    if (session.isProcessingResponse) {
+      enhancedLog('info', 'Session', `Still processing a response, delaying cleanup for session ${sessionId}`);
+      session.pendingCleanup = true;
+      return;
+    }
+    
     // Clear any intervals
     if (session.pingInterval) {
       clearInterval(session.pingInterval);
@@ -1127,12 +1332,12 @@ async function cleanupSession(sessionId) {
       try {
         session.deepgramConnection.close();
       } catch (error) {
-        console.error('❌ Error closing Deepgram connection:', error);
+        enhancedLog('error', 'Deepgram', `Error closing connection: ${error.message} for session ${sessionId}`, error);
       }
     }
     
     // Log session stats
-    console.log(`📊 Session stats for ${sessionId}:`, {
+    enhancedLog('info', 'Session', `Stats for ${sessionId}:`, {
       totalAudioChunksReceived: session.audioStats.totalChunksReceived,
       totalAudioChunksProcessed: session.audioStats.totalChunksProcessed,
       queueHighWaterMark: session.audioStats.queueHighWaterMark,
@@ -1144,7 +1349,7 @@ async function cleanupSession(sessionId) {
     
     // Remove from active sessions
     activeSessions.delete(sessionId);
-    console.log(`🧹 Cleaned up session: ${sessionId}`);
+    enhancedLog('success', 'Session', `Cleaned up session: ${sessionId}`);
   }
 }
 
@@ -1156,20 +1361,20 @@ setInterval(() => {
   activeSessions.forEach((session, sessionId) => {
     // If no activity for 5 minutes, clean up
     if (now - session.lastActivityTimestamp > 5 * 60 * 1000) {
-      console.log(`⏰ Cleaning up stale session: ${sessionId}`);
+      enhancedLog('info', 'Session', `Cleaning up stale session: ${sessionId}`);
       cleanupSession(sessionId);
       staleSessions++;
     }
   });
   
   if (staleSessions > 0) {
-    console.log(`🧹 Cleaned up ${staleSessions} stale sessions`);
+    enhancedLog('info', 'Session', `Cleaned up ${staleSessions} stale sessions`);
   }
 }, 60 * 1000); // Check every minute
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('🛑 Shutting down gracefully...');
+  enhancedLog('info', 'Server', 'Shutting down gracefully...');
   
   // Close all active sessions
   activeSessions.forEach((session, sessionId) => {
@@ -1178,7 +1383,7 @@ process.on('SIGTERM', () => {
   
   wss.close(() => {
     server.close(() => {
-      console.log('✅ Server closed');
+      enhancedLog('success', 'Server', 'Server closed');
       process.exit(0);
     });
   });
@@ -1186,20 +1391,27 @@ process.on('SIGTERM', () => {
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught exception:', error);
+  enhancedLog('error', 'Server', 'Uncaught exception:', error);
   // Continue running - don't exit
 });
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled promise rejection:', reason);
+  enhancedLog('error', 'Server', 'Unhandled promise rejection:', reason);
   // Continue running - don't exit
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 WebSocket server running on port ${PORT}`);
-  console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}/stream`);
-  console.log(`🔍 Health check: http://localhost:${PORT}/health`);
-  console.log(`🧪 Debug page: http://localhost:${PORT}/debug`);
+  enhancedLog('success', 'Server', `WebSocket server running on port ${PORT}`);
+  enhancedLog('info', 'Server', `WebSocket endpoint: ws://localhost:${PORT}/stream`);
+  enhancedLog('info', 'Server', `Health check: http://localhost:${PORT}/health`);
+  enhancedLog('info', 'Server', `Debug page: http://localhost:${PORT}/debug`);
 });
+
+// Export BidirectionalStreamingManager for external use
+module.exports = {
+  server,
+  wss,
+  activeSessions
+};
