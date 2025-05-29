@@ -452,106 +452,77 @@ wss.on('connection', async (ws, req) => {
     clearInterval(session.pingInterval);
     cleanupSession(sessionId);
   });
-
-  ws.on('error', (error) => {
-    console.error(`❌ WebSocket error for session ${sessionId}:`, error);
-    clearInterval(session.pingInterval);
-    cleanupSession(sessionId);
-  });
 });
 
 /**
- * Initialize Deepgram WebSocket connection for speech-to-text
+ * Initialize Deepgram STT connection
  * @param {Object} session - The session object
- * @returns {Promise<boolean>} - True if connection was successful
+ * @returns {Promise<boolean>} - True if successful
  */
 async function initializeDeepgramConnection(session) {
   try {
-    console.log('🎯 Initializing Deepgram connection...');
-
-    // Create WebSocket connection to Deepgram with proper URL parameters
-    // FIXED: Reverted to original working parameters from previous version
-    const deepgramUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
-      encoding: 'mulaw',
-      sample_rate: '8000',
-      channels: '1',
-      model: 'nova-2', // Reverted to original model
-      language: 'en-US',
-      interim_results: 'true', // Changed to true as in working version
-      punctuate: 'true',
-      utterance_end_ms: '1000',
-      endpointing: '300'
-    });
-
-    console.log('Connecting to Deepgram:', deepgramUrl);
-
-    // Log API key length for debugging (without revealing the key)
-    const apiKeyLength = process.env.DEEPGRAM_API_KEY ? process.env.DEEPGRAM_API_KEY.length : 0;
-    console.log(`Using Deepgram API key with length: ${apiKeyLength} characters`);
-
-    const deepgramWs = new WebSocket(deepgramUrl, {
-      headers: {
-        'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
-      },
-    });
-
-    // Set connection timeout
-    const connectionTimeout = setTimeout(() => {
-      if (deepgramWs.readyState !== WebSocket.OPEN) {
-        console.error('❌ Deepgram connection timeout');
-        deepgramWs.terminate();
-      }
-    }, 10000);
-
-    // Handle connection open
-    deepgramWs.on('open', () => {
-      clearTimeout(connectionTimeout);
-      console.log('✅ Connected to Deepgram with proper audio configuration');
-      
-      // Mark as ready and process queued audio
-      session.deepgramReady = true;
-      session.reconnectionAttempts = 0;
-      console.log(`🚀 Deepgram ready! Processing ${session.audioQueue.length} queued audio chunks`);
-      
-      // Send all queued audio
-      while (session.audioQueue.length > 0) {
-        const audioBuffer = session.audioQueue.shift();
-        if (deepgramWs.readyState === WebSocket.OPEN) {
-          deepgramWs.send(audioBuffer);
-          session.audioStats.totalChunksProcessed++;
-          console.log('📤 Sent queued audio chunk to Deepgram');
-        }
-      }
-      
-      // Send greeting if needed and we have the streamSid
-      if (!session.welcomeMessageSent && session.streamSid) {
-        sendGreetingMessage(session);
-      }
-    });
-
-    // Handle transcription results
-    deepgramWs.on('message', async (message) => {
+    // Close existing connection if any
+    if (session.deepgramConnection) {
       try {
-        const response = JSON.parse(message);
-        console.log('📝 Deepgram response received');
+        session.deepgramConnection.close();
+      } catch (error) {
+        console.error('❌ Error closing existing Deepgram connection:', error);
+      }
+    }
+    
+    // Create a new WebSocket connection to Deepgram
+    const deepgramUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&smart_format=true&filler_words=false&interim_results=false&endpointing=500';
+    
+    session.deepgramConnection = new WebSocket(deepgramUrl, {
+      headers: {
+        Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`
+      }
+    });
+    
+    // Set up event handlers
+    session.deepgramConnection.on('open', () => {
+      console.log('🎙️ Deepgram connection established');
+      session.deepgramReady = true;
+      
+      // Process any queued audio
+      if (session.audioQueue.length > 0) {
+        console.log(`📤 Processing ${session.audioQueue.length} queued audio chunks`);
         
-        // FIXED: Updated to match the working version's response handling
-        let transcript = "";
-        let isFinal = false;
-
-        // Handle response format from working version
-        if (response.channel?.alternatives?.[0]?.transcript) {
-          transcript = response.channel.alternatives[0].transcript;
-          isFinal = !!response.is_final;
-          
-          console.log('🎯 Deepgram transcript:', transcript, 'isFinal:', isFinal);
+        // Process all queued audio
+        for (const audioChunk of session.audioQueue) {
+          if (session.deepgramConnection.readyState === WebSocket.OPEN) {
+            session.deepgramConnection.send(audioChunk);
+            session.audioStats.totalChunksProcessed++;
+          }
         }
         
-        if (transcript && transcript.length > 0) {
-          if (isFinal) {
-            console.log('📝 Final transcript:', transcript);
+        // Clear the queue
+        session.audioQueue = [];
+      }
+    });
+    
+    session.deepgramConnection.on('message', async (data) => {
+      try {
+        const response = JSON.parse(data);
+        
+        // Check if this is a transcript
+        if (response.type === 'Results' && 
+            response.channel && 
+            response.channel.alternatives && 
+            response.channel.alternatives.length > 0) {
+          
+          const transcript = response.channel.alternatives[0].transcript;
+          
+          // Only process if we have actual text
+          if (transcript && transcript.trim()) {
+            console.log(`🎤 Transcript: "${transcript}"`);
             
+            // Add to conversation history
+            session.conversationHistory.push(transcript);
+            
+            // Don't process if we're already generating a response
             if (session.isProcessingResponse) {
+              console.log('⏳ Already processing a response, marking as pending');
               session.pendingResponse = true;
               return;
             }
@@ -559,339 +530,308 @@ async function initializeDeepgramConnection(session) {
             session.isProcessingResponse = true;
             
             try {
-              // Process with AI
-              const aiResponse = await generateAIResponse(transcript, session);
+              // Generate AI response
+              const aiResponse = await generateAIResponse(session, transcript);
               
               if (aiResponse) {
-                // Generate audio with Deepgram TTS
-                const audioBuffer = await generateDeepgramTTS(aiResponse);
+                console.log('AI response result received');
+                console.log(`🤖 AI response: ${aiResponse}`);
                 
-                if (audioBuffer) {
+                // Add to conversation history
+                session.conversationHistory.push(aiResponse);
+                
+                // Log conversation turn to database
+                await logConversationTurn(session, transcript, aiResponse);
+                
+                // Generate TTS for the response
+                const ttsAudio = await generateDeepgramTTS(aiResponse);
+                
+                if (ttsAudio) {
                   // Send audio back to Twilio
-                  const success = await sendAudioToTwilio(session, audioBuffer);
-                  
-                  if (success) {
-                    // Update conversation history
-                    session.conversationHistory.push(
-                      { role: "user", content: transcript },
-                      { role: "assistant", content: aiResponse }
-                    );
-                    
-                    // Log conversation
-                    await logConversationTurn(session, transcript, aiResponse);
-                  } else {
-                    console.error('❌ Failed to send audio to Twilio');
-                  }
+                  await sendAudioToTwilio(session, ttsAudio);
                 } else {
-                  console.error('❌ Failed to generate TTS audio');
-                  // Notify client of error
-                  sendErrorToClient(session, 'TTS_GENERATION_FAILED', 'Failed to generate speech from text');
+                  console.error('❌ Failed to generate TTS for AI response');
                 }
               } else {
                 console.error('❌ Failed to generate AI response');
-                // Notify client of error
-                sendErrorToClient(session, 'AI_RESPONSE_FAILED', 'Failed to generate AI response');
-              }
-              
-              if (session.pendingResponse) {
-                session.pendingResponse = false;
-                setTimeout(() => {
-                  session.isProcessingResponse = false;
-                }, 100);
-              } else {
-                session.isProcessingResponse = false;
               }
             } catch (error) {
-              console.error('❌ Error generating response:', error);
+              console.error('❌ Error processing transcript:', error);
+            } finally {
               session.isProcessingResponse = false;
-              // Notify client of error
-              sendErrorToClient(session, 'RESPONSE_GENERATION_ERROR', 'Error processing your request');
+              
+              // Check if we have a pending response to process
+              if (session.pendingResponse) {
+                console.log('⏳ Processing pending response');
+                session.pendingResponse = false;
+                
+                // Get the last user message from history
+                const lastUserMessage = session.conversationHistory[session.conversationHistory.length - 2];
+                
+                if (lastUserMessage) {
+                  // Process it
+                  session.isProcessingResponse = true;
+                  
+                  try {
+                    // Generate AI response
+                    const aiResponse = await generateAIResponse(session, lastUserMessage);
+                    
+                    if (aiResponse) {
+                      console.log('AI response result received for pending message');
+                      console.log(`🤖 AI response: ${aiResponse}`);
+                      
+                      // Add to conversation history
+                      session.conversationHistory.push(aiResponse);
+                      
+                      // Log conversation turn to database
+                      await logConversationTurn(session, lastUserMessage, aiResponse);
+                      
+                      // Generate TTS for the response
+                      const ttsAudio = await generateDeepgramTTS(aiResponse);
+                      
+                      if (ttsAudio) {
+                        // Send audio back to Twilio
+                        await sendAudioToTwilio(session, ttsAudio);
+                      } else {
+                        console.error('❌ Failed to generate TTS for pending AI response');
+                      }
+                    } else {
+                      console.error('❌ Failed to generate AI response for pending message');
+                    }
+                  } catch (error) {
+                    console.error('❌ Error processing pending transcript:', error);
+                  } finally {
+                    session.isProcessingResponse = false;
+                  }
+                }
+              }
             }
-          } else {
-            console.log('📝 Interim transcript:', transcript);
           }
         }
       } catch (error) {
-        console.error('❌ Deepgram message error:', error);
+        console.error('❌ Error parsing Deepgram response:', error);
       }
     });
-
-    deepgramWs.on('error', async (error) => {
-      clearTimeout(connectionTimeout);
+    
+    session.deepgramConnection.on('error', (error) => {
       console.error('❌ Deepgram connection error:', error);
-      
-      // FIXED: Enhanced error logging for Deepgram errors
-      if (error.response) {
-        try {
-          const errorBody = await error.response.text();
-          console.error('Deepgram error details:', errorBody);
-        } catch (e) {
-          console.error('Could not parse Deepgram error details:', e);
-        }
-      }
-      
       session.deepgramReady = false;
       
-      // Attempt reconnection
+      // Try to reconnect
       if (session.reconnectionAttempts < session.maxReconnectionAttempts) {
-        await reconnectDeepgramSTT(session);
-      } else {
-        // Notify client that we've exhausted reconnection attempts
-        sendErrorToClient(session, 'DEEPGRAM_CONNECTION_FAILED', 'Speech recognition service unavailable after multiple attempts');
+        reconnectDeepgramSTT(session);
       }
     });
-
-    deepgramWs.on('close', async (code, reason) => {
-      clearTimeout(connectionTimeout);
-      console.log(`🔌 Deepgram connection closed: ${code} - ${reason}`);
+    
+    session.deepgramConnection.on('close', (code, reason) => {
+      console.log(`🎙️ Deepgram connection closed: code=${code}, reason=${reason || 'No reason provided'}`);
       session.deepgramReady = false;
       
-      // Attempt reconnection on unexpected closure
-      if (code !== 1000 && session.reconnectionAttempts < session.maxReconnectionAttempts) {
-        await reconnectDeepgramSTT(session);
+      // Try to reconnect if session is still active
+      if (session.isActive && session.reconnectionAttempts < session.maxReconnectionAttempts) {
+        reconnectDeepgramSTT(session);
       }
     });
-
-    session.deepgramConnection = deepgramWs;
+    
     return true;
-
   } catch (error) {
-    console.error('❌ Failed to initialize Deepgram:', error);
+    console.error('❌ Error initializing Deepgram connection:', error);
+    session.deepgramReady = false;
     return false;
   }
 }
 
 /**
- * Reconnect to Deepgram STT service
+ * Reconnect to Deepgram STT
  * @param {Object} session - The session object
- * @returns {Promise<boolean>} - True if reconnection was successful
+ * @returns {Promise<boolean>} - True if successful
  */
 async function reconnectDeepgramSTT(session) {
   session.reconnectionAttempts++;
-  console.log(`Attempting to reconnect Deepgram STT (attempt ${session.reconnectionAttempts}/${session.maxReconnectionAttempts})`);
   
-  // Close existing connection if any
-  if (session.deepgramConnection) {
-    try {
-      session.deepgramConnection.close();
-    } catch (err) {
-      console.error("Error closing existing Deepgram connection:", err);
-    }
-  }
+  console.log(`🔄 Attempting to reconnect to Deepgram (attempt ${session.reconnectionAttempts}/${session.maxReconnectionAttempts})`);
   
-  // Reset connection state
-  session.deepgramReady = false;
-  
-  // Wait before reconnecting with exponential backoff
+  // Exponential backoff
   const backoffTime = Math.min(1000 * Math.pow(2, session.reconnectionAttempts - 1), 10000);
-  console.log(`Waiting ${backoffTime}ms before reconnection attempt`);
+  console.log(`⏳ Waiting ${backoffTime}ms before reconnecting...`);
+  
   await new Promise(resolve => setTimeout(resolve, backoffTime));
   
-  // Try to initialize a new connection
   return await initializeDeepgramConnection(session);
 }
 
 /**
- * Send greeting message to the client
+ * Send greeting message
  * @param {Object} session - The session object
- * @returns {Promise<void>}
+ * @returns {Promise<boolean>} - True if successful
  */
 async function sendGreetingMessage(session) {
   try {
-    if (session.welcomeMessageSent || !session.streamSid) {
-      return;
-    }
-    
+    // Increment greeting attempts
     session.greetingAttempts++;
-    console.log(`Sending greeting (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})...`);
     
-    // Get tenant configuration if possible
-    let greeting = "Hello! Thank you for calling Caring Clarity Counseling. I am Clara, your AI assistant. How can I help you today?";
-    
-    try {
-      // Try to get tenant-specific configuration
-      if (session.tenantId) {
-        const { data: tenant, error } = await supabase
-          .from("tenants")
-          .select("settings")
-          .eq("id", session.tenantId)
-          .single();
-
-        if (error) {
-          throw error;
-        }
-
-        if (tenant?.settings?.voice_agent?.greeting) {
-          greeting = tenant.settings.voice_agent.greeting;
-        }
-      }
-    } catch (error) {
-      console.error('❌ Error fetching tenant greeting, using default:', error);
+    // Check if we've already tried too many times
+    if (session.greetingAttempts > session.maxGreetingAttempts) {
+      console.error(`❌ Failed to send greeting after ${session.maxGreetingAttempts} attempts`);
+      return false;
     }
     
-    // Generate audio with Deepgram TTS
-    const audioBuffer = await generateDeepgramTTS(greeting);
+    console.log(`🤖 Sending greeting message (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})`);
     
-    if (audioBuffer) {
+    // Default greeting message
+    const greeting = "Hello! This is Caring Clarity's AI assistant. How can I help you schedule an appointment today?";
+    
+    // Add to conversation history
+    session.conversationHistory.push(greeting);
+    
+    // Generate TTS for the greeting
+    const ttsAudio = await generateDeepgramTTS(greeting);
+    
+    if (ttsAudio) {
       // Send audio back to Twilio
-      const success = await sendAudioToTwilio(session, audioBuffer);
+      const result = await sendAudioToTwilio(session, ttsAudio);
       
-      if (success) {
-        console.log('✅ Greeting sent successfully with Deepgram voice');
+      if (result) {
         session.welcomeMessageSent = true;
-        
-        // Add to conversation history
-        session.conversationHistory.push(
-          { role: "assistant", content: greeting }
-        );
+        console.log('✅ Greeting message sent successfully');
+        return true;
       } else {
-        console.error('❌ Failed to send greeting');
+        console.error('❌ Failed to send greeting audio to Twilio');
         
-        // Retry if we haven't exceeded max attempts
+        // Try again after a delay if we haven't reached the maximum attempts
         if (session.greetingAttempts < session.maxGreetingAttempts) {
-          console.log(`Will retry greeting in 1 second (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})`);
-          setTimeout(() => sendGreetingMessage(session), 1000);
+          console.log(`⏳ Will retry sending greeting in 2 seconds...`);
+          setTimeout(() => sendGreetingMessage(session), 2000);
         }
+        
+        return false;
       }
     } else {
-      console.error('❌ Failed to generate greeting audio');
+      console.error('❌ Failed to generate TTS for greeting');
       
-      // Retry if we haven't exceeded max attempts
+      // Try again after a delay if we haven't reached the maximum attempts
       if (session.greetingAttempts < session.maxGreetingAttempts) {
-        console.log(`Will retry greeting in 1 second (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})`);
-        setTimeout(() => sendGreetingMessage(session), 1000);
+        console.log(`⏳ Will retry sending greeting in 2 seconds...`);
+        setTimeout(() => sendGreetingMessage(session), 2000);
       }
+      
+      return false;
     }
   } catch (error) {
-    console.error('❌ Error sending greeting:', error);
-    
-    // Retry if we haven't exceeded max attempts
-    if (session.greetingAttempts < session.maxGreetingAttempts) {
-      console.log(`Will retry greeting in 1 second (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts})`);
-      setTimeout(() => sendGreetingMessage(session), 1000);
-    }
+    console.error('❌ Error sending greeting message:', error);
+    return false;
   }
 }
 
 /**
  * Generate AI response using Groq
- * @param {string} transcript - The user's transcript
  * @param {Object} session - The session object
- * @returns {Promise<string|null>} - The AI response or null if failed
+ * @param {string} userMessage - The user's message
+ * @returns {Promise<string|null>} - AI response or null if failed
  */
-async function generateAIResponse(transcript, session) {
+async function generateAIResponse(session, userMessage) {
   try {
-    console.log('🤖 Generating AI response for:', transcript);
+    console.log('🧠 Generating AI response...');
     
-    // Get tenant configuration if possible
-    let systemPrompt = `You are Clara, a warm and professional intake assistant for a mental health practice. 
-     Keep responses conversational, concise, and natural for speech. 
-     Avoid special characters or formatting. 
-     Aim for 1-3 sentences unless more detail is requested.
-     
-     Your role is to:
-     1. Gather basic intake information from new clients
-     2. Schedule appointments  
-     3. Take messages for the counselor
-     4. Provide general information about services
-     5. Handle crisis situations by directing to emergency services
-     
-     Always maintain a warm, professional tone and respect confidentiality.`;
+    // Add retry logic
+    const maxRetries = 3;
+    let retryCount = 0;
+    let lastError = null;
     
-    try {
-      // Try to get tenant-specific configuration
-      if (session.tenantId) {
-        const { data: tenant, error } = await supabase
-          .from("tenants")
-          .select("id")
-          .eq("business_type", "counseling")
-          .single();
-
-        if (error) {
-          throw error;
+    while (retryCount < maxRetries) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+        
+        // Prepare conversation history for the AI
+        const messages = [];
+        
+        // System message
+        messages.push({
+          role: "system",
+          content: `You are an AI assistant for Caring Clarity, a counseling practice. Your name is Claire.
+Your job is to help callers schedule appointments with our therapists.
+Be warm, empathetic, and professional. Keep responses brief and conversational.
+Ask for the following information:
+1. Whether they're seeking services for themselves, a child, or as a couple
+2. Their name
+3. Email address
+4. State of residence (we can only serve clients in certain states)
+5. Phone number
+6. Best days/times for appointments
+7. Insurance information (if any)
+Once you have this information, tell them that someone from our team will contact them soon to confirm their appointment.
+If they ask questions about our services, provide brief information and guide them back to scheduling.
+If they express distress or crisis, express empathy and ask if they'd like resources for immediate support.`
+        });
+        
+        // Add conversation history
+        for (let i = 0; i < session.conversationHistory.length; i++) {
+          const role = i % 2 === 0 ? "user" : "assistant";
+          messages.push({
+            role: role,
+            content: session.conversationHistory[i]
+          });
         }
+        
+        // Add current user message
+        messages.push({
+          role: "user",
+          content: userMessage
+        });
+        
+        // Call Groq API
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'llama3-8b-8192',
+            messages: messages,
+            temperature: 0.7,
+            max_tokens: 800,
+          }),
+          signal: controller.signal
+        });
 
-        if (tenant?.id) {
-          const { data: agentConfig, error: configError } = await supabase
-            .from("agent_configs")
-            .select("*")
-            .eq("tenant_id", tenant.id)
-            .eq("active", true)
-            .single();
-            
-          if (configError) {
-            throw configError;
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.choices && data.choices.length > 0) {
+            return data.choices[0].message.content;
+          } else {
+            console.error('❌ Groq API returned empty choices array');
+            lastError = new Error('Empty choices array');
           }
-            
-          if (agentConfig?.system_prompt) {
-            systemPrompt = agentConfig.system_prompt;
-          }
+        } else {
+          const errorText = await response.text();
+          console.error(`❌ Groq API error (attempt ${retryCount + 1}/${maxRetries}):`, 
+                        response.status, response.statusText, errorText);
+          lastError = new Error(`HTTP ${response.status}: ${errorText}`);
         }
+      } catch (error) {
+        clearTimeout(timeoutId);
+        console.error(`❌ Groq API error (attempt ${retryCount + 1}/${maxRetries}):`, error);
+        lastError = error;
       }
-    } catch (error) {
-      console.error('❌ Error fetching agent config, using default prompt:', error);
+      
+      retryCount++;
+      if (retryCount < maxRetries) {
+        // Exponential backoff
+        const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
+        console.log(`Waiting ${backoffTime}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, backoffTime));
+      }
     }
-
-    // Generate AI response using Groq with timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
     
-    try {
-      // FIXED: Updated to use a widely available model
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          // FIXED: Changed to a widely available model
-          model: 'llama3-8b-8192', // Changed from 'llama-3.1-70b' to 'llama3-8b-8192'
-          messages: [
-            {
-              role: 'system',
-              content: systemPrompt
-            },
-            ...session.conversationHistory.slice(-10), // Keep last 10 messages for context
-            { role: 'user', content: transcript }
-          ],
-          max_tokens: 150,
-          temperature: 0.7,
-        }),
-        signal: controller.signal
-      });
-
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`❌ Groq API error: ${response.status} ${response.statusText}`, errorText);
-        return "I'm sorry, I'm having trouble processing your request right now. Could you please try again?";
-      }
-
-      const result = await response.json();
-      console.log('AI response result received');
-      
-      const aiMessage = result.choices?.[0]?.message?.content;
-
-      if (aiMessage) {
-        console.log('🤖 AI response:', aiMessage);
-        return aiMessage;
-      } else {
-        console.error('❌ Empty AI response:', result);
-        return "I'm sorry, I didn't catch that. Could you please repeat?";
-      }
-    } catch (error) {
-      clearTimeout(timeoutId);
-      if (error.name === 'AbortError') {
-        console.error('❌ AI response timeout');
-        return "I'm sorry, it's taking me longer than expected to process your request. Could you please try again?";
-      }
-      throw error;
-    }
+    console.error('❌ All Groq API attempts failed:', lastError);
+    return null;
   } catch (error) {
-    console.error('❌ AI response error:', error);
-    return "I'm sorry, I didn't catch that. Could you please repeat?";
+    console.error('❌ Error generating AI response:', error);
+    return null;
   }
 }
 
@@ -963,7 +903,7 @@ async function generateDeepgramTTS(text) {
 }
 
 /**
- * Send audio to Twilio
+ * Send audio to Twilio with proper mark header and media format
  * @param {Object} session - The session object
  * @param {Buffer} audioBuffer - The audio buffer to send
  * @returns {Promise<boolean>} - True if successful
@@ -985,21 +925,28 @@ async function sendAudioToTwilio(session, audioBuffer) {
     // Convert audio to base64 for Twilio
     const base64Audio = audioBuffer.toString('base64');
     
-    // FIXED: Added proper track direction, chunk sequencing, and timestamp
-    // Send media message back to Twilio stream
+    // Create a unique mark name for this audio chunk
+    const markName = `response-${Date.now()}-${session.outboundChunkCounter}`;
+    
+    // Send media message back to Twilio stream with proper format
     const mediaMessage = {
       event: 'media',
       streamSid: session.streamSid,
       media: {
-        track: "outbound",  // Added track direction
-        chunk: session.outboundChunkCounter++,  // Added chunk sequencing
-        timestamp: Date.now(),  // Added timestamp
-        payload: base64Audio
+        track: "outbound",
+        chunk: session.outboundChunkCounter++,
+        timestamp: Date.now(),
+        payload: base64Audio,
+        streamSid: session.streamSid  // Include streamSid in media object too
+      },
+      // Add mark header which is required by Twilio for outbound audio
+      mark: {
+        name: markName
       }
     };
     
     // Log detailed information about the audio being sent
-    console.log(`🔊 Sending audio to Twilio: ${audioBuffer.length} bytes, chunk ${session.outboundChunkCounter - 1}`);
+    console.log(`🔊 Sending audio to Twilio: ${audioBuffer.length} bytes, chunk ${session.outboundChunkCounter - 1}, mark: ${markName}`);
     
     // Send through WebSocket back to Twilio
     session.ws.send(JSON.stringify(mediaMessage));
