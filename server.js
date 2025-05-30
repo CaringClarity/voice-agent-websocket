@@ -496,9 +496,18 @@ wss.on("connection", async (ws, req) => {
         enhancedLog("info", "WebSocket", `Received event: ${data.event}`);
         
         // Store streamSid if this is a start event
-        if (data.event === "start" && data.start && data.start.streamSid) {
+        
+      // ✅ Log START event to ensure streamSid is received
+      if (data.event === "start") {
+        enhancedLog("debug", "Twilio", `✅ START EVENT RECEIVED: ${JSON.stringify(data)}`);
+        if (data.start?.streamSid) {
           session.streamSid = data.start.streamSid;
-          enhancedLog("info", "Stream", `Started with SID: ${session.streamSid}`);
+          enhancedLog("success", "Twilio", `StreamSid set: ${session.streamSid}`);
+        } else {
+          enhancedLog("error", "Twilio", "❌ Start event received with missing streamSid");
+        }
+      }
+`);
           
           // Send greeting if needed and we have the streamSid
           if (!session.welcomeMessageSent && session.streamSid) {
@@ -972,6 +981,12 @@ async function sendAudioToTwilio(session, audioBuffer) {
       return false;
     }
     
+    
+  if (!session.streamSid) {
+    enhancedLog("error", "Twilio", `❌ Cannot send TTS audio — streamSid is missing for session ${session.sessionId}`);
+    return false;
+  }
+
     enhancedLog("audio", "TTS", `Preparing to send audio (${audioBuffer.length} bytes) for session ${session.sessionId}`);
     
     // Validate audio format
