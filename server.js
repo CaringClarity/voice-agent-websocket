@@ -526,7 +526,7 @@ wss.on("connection", async (ws, req) => {
               session.deepgramConnection.readyState === WebSocket.OPEN) {
             session.deepgramConnection.send(audioBuffer);
             session.audioStats.totalChunksProcessed++;
-            enhancedLog("debug", "Deepgram", `Forwarded audio chunk`);
+            enhancedLog("debug", "Deepgram", "Forwarded audio chunk");
           } else {
             // Queue audio until Deepgram is ready
             if (session.audioQueue.length < 500) {
