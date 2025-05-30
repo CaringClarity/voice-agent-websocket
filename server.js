@@ -11,7 +11,8 @@
  * - Enhanced audio format validation
  * - Added comprehensive logging
  * - Improved error handling
- * - ADDED: Granular logging for TTS generation and audio transmission
+ * - ADDED: Raw WebSocket message capture for Deepgram debugging
+ * - ADDED: Explicit transcript format validation
  */
 const express = require("express");
 const http = require("http");
@@ -19,6 +20,7 @@ const WebSocket = require("ws");
 const { createClient } = require("@supabase/supabase-js");
 const dotenv = require("dotenv");
 const { v4: uuidv4 } = require("uuid");
+const fs = require("fs");
 
 // Load environment variables from .env file if present
 dotenv.config();
@@ -273,6 +275,21 @@ app.get("/groq-models", async (req, res) => {
   }
 });
 
+// Endpoint to view Deepgram debug logs
+app.get("/deepgram-logs", (req, res) => {
+  try {
+    const logPath = "./deepgram-debug.log";
+    if (fs.existsSync(logPath)) {
+      const logs = fs.readFileSync(logPath, 'utf8');
+      res.type('text/plain').send(logs);
+    } else {
+      res.type('text/plain').send("No Deepgram debug logs available yet.");
+    }
+  } catch (error) {
+    res.status(500).send(`Error reading logs: ${error.message}`);
+  }
+});
+
 /**
  * Enhanced logging utility
  * @param {string} level - Log level (info, warn, error, debug)
@@ -307,6 +324,16 @@ function enhancedLog(level, category, message, data = null) {
       break;
     default:
       console.log(logMessage, data ? data : "");
+  }
+  
+  // If this is a Deepgram-related log, also write to debug file
+  if (category === "Deepgram") {
+    try {
+      const debugLogMessage = `${timestamp} [${level.toUpperCase()}] ${message} ${data ? JSON.stringify(data) : ""}\n`;
+      fs.appendFileSync("./deepgram-debug.log", debugLogMessage);
+    } catch (error) {
+      console.error(`Error writing to Deepgram debug log: ${error.message}`);
+    }
   }
 }
 
@@ -403,7 +430,10 @@ wss.on("connection", async (ws, req) => {
         queueHighWaterMark: 0
       },
       // Add outbound chunk counter for audio sequencing
-      outboundChunkCounter: 1
+      outboundChunkCounter: 1,
+      // Add Deepgram message tracking
+      deepgramMessages: 0,
+      deepgramTranscripts: 0
     };
 
     activeSessions.set(sessionId, session);
@@ -609,7 +639,9 @@ async function initializeDeepgramConnection(session) {
     
     // REVERTED: Use direct WebSocket connection to Deepgram instead of SDK
     // This is the approach that was working before
-    const deepgramUrl = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&smart_format=true&interim_results=false&language=en";
+    // FIXED: Added debug=true parameter to get more verbose responses from Deepgram
+    const deepgramUrl = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&smart_format=true&interim_results=false&language=en&debug=true";
+    enhancedLog("debug", "Deepgram", `Connection URL: ${deepgramUrl}`);
     
     const deepgramConnection = new WebSocket(deepgramUrl, {
       headers: {
@@ -647,15 +679,21 @@ async function initializeDeepgramConnection(session) {
     // Also handle the direct WebSocket message format
     deepgramConnection.on("message", async (data) => {
       // ADDED: Granular logging for transcript handling
-      enhancedLog("debug", "Deepgram", `Received message from Deepgram (length: ${data.length}) for session ${session.sessionId}`);
+      session.deepgramMessages++;
+      enhancedLog("debug", "Deepgram", `Received message #${session.deepgramMessages} from Deepgram (length: ${data.length}) for session ${session.sessionId}`);
       
       try {
+        // Save raw message for debugging
+        const rawMessage = data.toString();
+        enhancedLog("debug", "Deepgram", `Raw message: ${rawMessage}`);
+        
         // Parse the JSON response from Deepgram
-        const response = JSON.parse(data);
+        const response = JSON.parse(rawMessage);
         enhancedLog("debug", "Deepgram", `Parsed Deepgram message: ${JSON.stringify(response)}`);
         
         // Check if this is a transcript with alternatives
-        if (response.channel && 
+        if (response.type === "Results" && 
+            response.channel && 
             response.channel.alternatives && 
             response.channel.alternatives.length > 0) {
           
@@ -664,7 +702,8 @@ async function initializeDeepgramConnection(session) {
           
           // Only process if we have actual text
           if (transcript && transcript.trim()) {
-            enhancedLog("transcript", "Deepgram", `"${transcript}"`);
+            session.deepgramTranscripts++;
+            enhancedLog("transcript", "Deepgram", `Transcript #${session.deepgramTranscripts}: "${transcript}"`);
             
             // Add to conversation history
             session.conversationHistory.push(transcript);
@@ -778,6 +817,10 @@ async function initializeDeepgramConnection(session) {
               }
             }
           }
+        } else if (response.type === "Metadata") {
+          enhancedLog("info", "Deepgram", `Received metadata: ${JSON.stringify(response)}`);
+        } else if (response.type === "UtteranceEnd") {
+          enhancedLog("info", "Deepgram", `Utterance end: ${JSON.stringify(response)}`);
         } else {
           enhancedLog("debug", "Deepgram", `Received non-transcript message: ${JSON.stringify(response)}`);
         }
@@ -850,8 +893,8 @@ function validateAudioFormat(audioBuffer) {
     }
     
     // ADDED: Log first few bytes for debugging
-    const firstBytes = audioBuffer.slice(0, 10).toString("hex");
-    enhancedLog("debug", "Audio", `Validating audio buffer (size: ${audioBuffer.length} bytes, first 10 bytes: ${firstBytes})`);
+    const firstBytes = audioBuffer.slice(0, 20).toString("hex");
+    enhancedLog("debug", "Audio", `Validating audio buffer (size: ${audioBuffer.length} bytes, first 20 bytes: ${firstBytes})`);
     
     // Check if buffer size is reasonable for audio
     // A few seconds of 8kHz μ-law audio should be at least a few KB
@@ -976,7 +1019,9 @@ async function sendAudioToTwilio(session, audioBuffer) {
         session.ws.send(JSON.stringify(mediaMessage));
         
         // ADDED: More detailed logging for each chunk
-        enhancedLog("debug", "Twilio", `Sent audio chunk ${i+1}/${chunks.length}, size: ${payload.length}, first 10 bytes (base64): ${payload.substring(0, 10)}... for session ${session.sessionId}`);
+        if (i === 0 || i === chunks.length - 1 || i % 50 === 0) {
+          enhancedLog("debug", "Twilio", `Sent audio chunk ${i+1}/${chunks.length}, size: ${payload.length}, first 10 bytes (base64): ${payload.substring(0, 10)}... for session ${session.sessionId}`);
+        }
         chunksSent++;
         
         // Add a small delay between chunks to prevent overwhelming Twilio
@@ -1095,7 +1140,7 @@ async function generateDeepgramTTS(text) {
     while (retryCount < maxRetries) {
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
         
         // FIXED: Ensure we're using the correct format for Twilio
         // Must be 8kHz, mono, µ-law encoded
@@ -1124,8 +1169,17 @@ async function generateDeepgramTTS(text) {
           // Verify audio format
           if (audioBuffer.length > 0) {
             // ADDED: Log first few bytes for debugging
-            const firstBytes = audioBuffer.slice(0, 10).toString("hex");
-            enhancedLog("debug", "TTS", `Generated audio buffer first 10 bytes: ${firstBytes}`);
+            const firstBytes = audioBuffer.slice(0, 20).toString("hex");
+            enhancedLog("debug", "TTS", `Generated audio buffer first 20 bytes: ${firstBytes}`);
+            
+            // Save a sample of the audio for debugging
+            try {
+              fs.writeFileSync(`./tts-sample-${Date.now()}.mulaw`, audioBuffer.slice(0, 1000));
+              enhancedLog("debug", "TTS", "Saved TTS sample for debugging");
+            } catch (error) {
+              enhancedLog("error", "TTS", `Failed to save TTS sample: ${error.message}`);
+            }
+            
             return audioBuffer;
           } else {
             enhancedLog("error", "TTS", `Deepgram returned empty audio buffer`);
@@ -1381,7 +1435,9 @@ async function cleanupSession(sessionId) {
       conversationTurns: session.conversationHistory.length / 2,
       reconnectionAttempts: session.reconnectionAttempts,
       greetingAttempts: session.greetingAttempts,
-      outboundChunks: session.outboundChunkCounter - 1
+      outboundChunks: session.outboundChunkCounter - 1,
+      deepgramMessages: session.deepgramMessages,
+      deepgramTranscripts: session.deepgramTranscripts
     });
     
     // Remove from active sessions
@@ -1444,6 +1500,7 @@ server.listen(PORT, "0.0.0.0", () => {
   enhancedLog("info", "Server", `WebSocket endpoint: ws://localhost:${PORT}/stream`);
   enhancedLog("info", "Server", `Health check: http://localhost:${PORT}/health`);
   enhancedLog("info", "Server", `Debug page: http://localhost:${PORT}/debug`);
+  enhancedLog("info", "Server", `Deepgram logs: http://localhost:${PORT}/deepgram-logs`);
 });
 
 // Export BidirectionalStreamingManager for external use
