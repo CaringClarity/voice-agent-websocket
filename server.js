@@ -535,7 +535,7 @@ wss.on("connection", async (ws, req) => {
               if (session.audioQueue.length > session.audioStats.queueHighWaterMark) {
                 session.audioStats.queueHighWaterMark = session.audioQueue.length;
               }
-              enhancedLog("debug", "Audio", `Queued chunk (queue size: ${session.audioQueue.length})`);
+              enhancedLog("debug", "Audio", "Queued chunk (queue size: " + session.audioQueue.length + ")");
             } else {
               enhancedLog("warn", "Audio", `Queue full, dropping chunk (queue size: ${session.audioQueue.length})`);
               // If queue is full and Deepgram is not ready, try to reconnect
