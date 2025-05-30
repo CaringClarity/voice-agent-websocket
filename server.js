@@ -53,7 +53,7 @@ if (missingEnvVars.length > 0) {
 console.log("✅ Environment variables checked");
 
 // Initialize Supabase client
-// FIXED: Ensure we"re using the REST API URL, not a PostgreSQL connection string
+// FIXED: Ensure we're using the REST API URL, not a PostgreSQL connection string
 const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -369,7 +369,7 @@ wss.on("connection", async (ws, req) => {
     session.isActive = true;
     session.lastActivityTimestamp = Date.now();
     
-    // Don"t reset other session state to maintain conversation continuity
+    // Don't reset other session state to maintain conversation continuity
   } else {
     // Initialize new session
     session = {
@@ -418,7 +418,7 @@ wss.on("connection", async (ws, req) => {
   session.pingInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       const now = Date.now();
-      // Only send ping if we haven"t received anything in the last 10 seconds
+      // Only send ping if we haven't received anything in the last 10 seconds
       if (now - session.lastActivityTimestamp > 10000) {
         try {
           ws.ping();
@@ -507,12 +507,12 @@ wss.on("connection", async (ws, req) => {
           }
         }
         
-        // FIXED: Don"t immediately clean up on stop event
+        // FIXED: Don't immediately clean up on stop event
         // Instead, mark session for delayed cleanup to ensure all responses are sent
         if (data.event === "stop") {
           enhancedLog("info", "Stream", `Stop event received for session ${sessionId}`);
           
-          // Check if we"re still processing a response
+          // Check if we're still processing a response
           if (session.isProcessingResponse) {
             enhancedLog("info", "Session", `Still processing a response, delaying cleanup for session ${sessionId}`);
             
@@ -569,12 +569,12 @@ wss.on("connection", async (ws, req) => {
     session.lastActivityTimestamp = Date.now();
   });
 
-  // FIXED: Don"t immediately clean up on WebSocket close
+  // FIXED: Don't immediately clean up on WebSocket close
   ws.on("close", (code, reason) => {
     enhancedLog("info", "WebSocket", `Connection closed: ${sessionId}, code: ${code}, reason: ${reason || "No reason provided"}`);
     clearInterval(session.pingInterval);
     
-    // Don"t immediately remove the session
+    // Don't immediately remove the session
     // Mark it as inactive but keep it around for a while in case of reconnection
     session.isActive = false;
     
@@ -669,7 +669,7 @@ async function initializeDeepgramConnection(session) {
             // Add to conversation history
             session.conversationHistory.push(transcript);
             
-            // Don"t process if we"re already generating a response
+            // Don't process if we're already generating a response
             if (session.isProcessingResponse) {
               enhancedLog("info", "AI", `Already processing a response, marking as pending for session ${session.sessionId}`);
               session.pendingResponse = true;
@@ -863,7 +863,7 @@ function validateAudioFormat(audioBuffer) {
       };
     }
     
-    // For μ-law audio, we can"t easily check the encoding without decoding
+    // For μ-law audio, we can't easily check the encoding without decoding
     // But we can check if the buffer size is a multiple of expected chunk size
     // 20ms of 8kHz audio = 160 bytes
     const remainder = audioBuffer.length % 160;
@@ -1008,7 +1008,7 @@ async function sendGreetingMessage(session) {
     // Increment greeting attempts
     session.greetingAttempts++;
     
-    // Check if we"ve already tried too many times
+    // Check if we've already tried too many times
     if (session.greetingAttempts > session.maxGreetingAttempts) {
       enhancedLog("error", "Greeting", `Failed to send after ${session.maxGreetingAttempts} attempts for session ${session.sessionId}`);
       return false;
@@ -1017,7 +1017,7 @@ async function sendGreetingMessage(session) {
     enhancedLog("info", "Greeting", `Sending message (attempt ${session.greetingAttempts}/${session.maxGreetingAttempts}) for session ${session.sessionId}`);
     
     // Default greeting message
-    const greeting = "Hello! This is Caring Clarity"s AI assistant. How can I help you schedule an appointment today?";
+    const greeting = "Hello! This is Caring Clarity's AI assistant. How can I help you schedule an appointment today?";
     
     // Add to conversation history
     session.conversationHistory.push(greeting);
@@ -1042,7 +1042,7 @@ async function sendGreetingMessage(session) {
         } else {
           enhancedLog("error", "Greeting", `Failed to send audio to Twilio for session ${session.sessionId}`);
           
-          // Try again after a delay if we haven"t reached the maximum attempts
+          // Try again after a delay if we haven't reached the maximum attempts
           if (session.greetingAttempts < session.maxGreetingAttempts) {
             enhancedLog("info", "Greeting", `Will retry in 2 seconds for session ${session.sessionId}`);
             setTimeout(() => sendGreetingMessage(session), 2000);
@@ -1053,7 +1053,7 @@ async function sendGreetingMessage(session) {
       } else {
         enhancedLog("error", "Greeting", `Cannot send: WebSocket not open for session ${session.sessionId}`);
         
-        // Try again after a delay if we haven"t reached the maximum attempts
+        // Try again after a delay if we haven't reached the maximum attempts
         if (session.greetingAttempts < session.maxGreetingAttempts) {
           enhancedLog("info", "Greeting", `Will retry in 2 seconds for session ${session.sessionId}`);
           setTimeout(() => sendGreetingMessage(session), 2000);
@@ -1064,7 +1064,7 @@ async function sendGreetingMessage(session) {
     } else {
       enhancedLog("error", "Greeting", `Failed to generate TTS for session ${session.sessionId}`);
       
-      // Try again after a delay if we haven"t reached the maximum attempts
+      // Try again after a delay if we haven't reached the maximum attempts
       if (session.greetingAttempts < session.maxGreetingAttempts) {
         enhancedLog("info", "Greeting", `Will retry in 2 seconds for session ${session.sessionId}`);
         setTimeout(() => sendGreetingMessage(session), 2000);
@@ -1097,7 +1097,7 @@ async function generateDeepgramTTS(text) {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
         
-        // FIXED: Ensure we"re using the correct format for Twilio
+        // FIXED: Ensure we're using the correct format for Twilio
         // Must be 8kHz, mono, µ-law encoded
         const ttsUrl = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000";
         enhancedLog("debug", "TTS", `Calling Deepgram TTS API: ${ttsUrl}`);
@@ -1162,7 +1162,7 @@ async function generateDeepgramTTS(text) {
 /**
  * Generate AI response using Groq
  * @param {Object} session - The session object
- * @param {string} userMessage - The user"s message
+ * @param {string} userMessage - The user's message
  * @returns {Promise<string|null>} - AI response or null if failed
  */
 async function generateAIResponse(session, userMessage) {
@@ -1189,7 +1189,7 @@ async function generateAIResponse(session, userMessage) {
 Your job is to help callers schedule appointments with our therapists.
 Be warm, empathetic, and professional. Keep responses brief and conversational.
 Ask for the following information:
-1. Whether they"re seeking services for themselves, a child, or as a couple
+1. Whether they're seeking services for themselves, a child, or as a couple
 2. Their name
 3. Email address
 4. State of residence (we can only serve clients in certain states)
@@ -1198,7 +1198,7 @@ Ask for the following information:
 7. Insurance information (if any)
 Once you have this information, tell them that someone from our team will contact them soon to confirm their appointment.
 If they ask questions about our services, provide brief information and guide them back to scheduling.
-If they express distress or crisis, express empathy and ask if they"d like resources for immediate support.`
+If they express distress or crisis, express empathy and ask if they'd like resources for immediate support.`
         });
         
         // Add conversation history
@@ -1279,8 +1279,8 @@ If they express distress or crisis, express empathy and ask if they"d like resou
 /**
  * Log conversation turn to database
  * @param {Object} session - The session object
- * @param {string} userMessage - The user"s message
- * @param {string} aiResponse - The AI"s response
+ * @param {string} userMessage - The user's message
+ * @param {string} aiResponse - The AI's response
  * @returns {Promise<boolean>} - True if successful
  */
 async function logConversationTurn(session, userMessage, aiResponse) {
@@ -1291,7 +1291,7 @@ async function logConversationTurn(session, userMessage, aiResponse) {
       return false;
     }
     
-    // FIXED: Ensure we"re using the proper Supabase client without credentials in URL
+    // FIXED: Ensure we're using the proper Supabase client without credentials in URL
     try {
       enhancedLog("debug", "Database", `Logging conversation turn for session ${session.sessionId}`);
       const { error } = await supabase.from("conversation_turns").insert({
@@ -1352,7 +1352,7 @@ function sendErrorToClient(session, code, message) {
 async function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId);
   if (session) {
-    // FIXED: Check if we"re still processing a response
+    // FIXED: Check if we're still processing a response
     if (session.isProcessingResponse) {
       enhancedLog("info", "Session", `Still processing a response, delaying cleanup for session ${sessionId}`);
       session.pendingCleanup = true;
@@ -1429,13 +1429,13 @@ process.on("SIGTERM", () => {
 // Handle uncaught exceptions
 process.on("uncaughtException", (error) => {
   enhancedLog("error", "Server", "Uncaught exception:", error);
-  // Continue running - don"t exit
+  // Continue running - don't exit
 });
 
 // Handle unhandled promise rejections
 process.on("unhandledRejection", (reason, promise) => {
   enhancedLog("error", "Server", "Unhandled promise rejection:", reason);
-  // Continue running - don"t exit
+  // Continue running - don't exit
 });
 
 const PORT = process.env.PORT || 10000;
