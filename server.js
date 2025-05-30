@@ -3,6 +3,7 @@
  * With Deepgram TTS for greeting and responses
  * 
  * FIXES IMPLEMENTED:
+ * - Reverted to direct WebSocket connection for Deepgram (known working method)
  * - Corrected sessionId handling
  * - Fixed Deepgram event handling (transcript instead of transcriptReceived)
  * - Improved WebSocket lifecycle management
@@ -15,7 +16,6 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
-const { createDeepgramClient } = require('@deepgram/sdk');
 const dotenv = require('dotenv');
 const { v4: uuidv4 } = require('uuid');
 
@@ -522,13 +522,13 @@ wss.on('connection', async (ws, req) => {
             setTimeout(() => {
               if (session.pendingCleanup) {
                 enhancedLog('info', 'Session', `Performing delayed cleanup after stop event for session ${sessionId}`);
-                cleanupSession(session.sessionId);
+                cleanupSession(sessionId);
               }
             }, 10000); // 10 second delay
           } else {
             // No active processing, can clean up now
             enhancedLog('info', 'Session', `Performing immediate cleanup after stop event for session ${sessionId}`);
-            await cleanupSession(session.sessionId);
+            await cleanupSession(sessionId);
           }
         }
       } catch (jsonError) {
@@ -606,24 +606,20 @@ async function initializeDeepgramConnection(session) {
     
     enhancedLog('info', 'Deepgram', `Initializing connection for session ${session.sessionId}`);
     
-    // Create Deepgram client
-    const deepgram = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
+    // REVERTED: Use direct WebSocket connection to Deepgram instead of SDK
+    // This is the approach that was working before
+    const deepgramUrl = 'wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&smart_format=true&interim_results=false&language=en';
     
-    // Create live transcription connection
-    const connection = deepgram.listen.live({
-      model: 'nova-2',
-      smart_format: true,
-      interim_results: false,
-      language: 'en',
-      encoding: 'mulaw',
-      sample_rate: 8000,
-      channels: 1
+    const deepgramConnection = new WebSocket(deepgramUrl, {
+      headers: {
+        'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`
+      }
     });
     
-    session.deepgramConnection = connection;
+    session.deepgramConnection = deepgramConnection;
     
     // Set up event handlers
-    connection.on('open', () => {
+    deepgramConnection.on('open', () => {
       enhancedLog('success', 'Deepgram', `Connection established for session ${session.sessionId}`);
       session.deepgramReady = true;
       
@@ -647,17 +643,21 @@ async function initializeDeepgramConnection(session) {
     });
     
     // FIXED: Changed from 'transcriptReceived' to 'transcript' event
-    connection.on('transcript', async (data) => {
+    // Also handle the direct WebSocket message format
+    deepgramConnection.on('message', async (data) => {
       try {
+        // Parse the JSON response from Deepgram
+        const response = JSON.parse(data);
+        
         // Log the transcript data for debugging
         enhancedLog('debug', 'Deepgram', `Received transcript data for session ${session.sessionId}`);
         
         // Check if this is a transcript with alternatives
-        if (data.channel && 
-            data.channel.alternatives && 
-            data.channel.alternatives.length > 0) {
+        if (response.channel && 
+            response.channel.alternatives && 
+            response.channel.alternatives.length > 0) {
           
-          const transcript = data.channel.alternatives[0].transcript;
+          const transcript = response.channel.alternatives[0].transcript;
           
           // Only process if we have actual text
           if (transcript && transcript.trim()) {
@@ -773,7 +773,7 @@ async function initializeDeepgramConnection(session) {
       }
     });
     
-    connection.on('error', (error) => {
+    deepgramConnection.on('error', (error) => {
       enhancedLog('error', 'Deepgram', `Connection error for session ${session.sessionId}: ${error.message}`, error);
       session.deepgramReady = false;
       
@@ -783,7 +783,7 @@ async function initializeDeepgramConnection(session) {
       }
     });
     
-    connection.on('close', (code, reason) => {
+    deepgramConnection.on('close', (code, reason) => {
       enhancedLog('info', 'Deepgram', `Connection closed for session ${session.sessionId}: code=${code}, reason=${reason || 'No reason provided'}`);
       session.deepgramReady = false;
       
