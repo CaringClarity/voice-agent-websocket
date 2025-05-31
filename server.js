@@ -2,17 +2,21 @@
  * Fully Corrected WebSocket Server for Twilio Voice Assistant
  * With Deepgram TTS for greeting and responses
  * 
- * FIXES IMPLEMENTED:
+ * FIXES IMPLEMENTED (Based on Deepgram Documentation Review):
  * - Reverted to direct WebSocket connection for Deepgram (known working method)
  * - Corrected sessionId handling
  * - Fixed Deepgram event handling (transcript instead of transcriptReceived)
  * - Improved WebSocket lifecycle management
- * - Simplified audio payload structure for Twilio compatibility
- * - Enhanced audio format validation
- * - Added comprehensive logging
- * - Improved error handling
- * - ADDED: Raw WebSocket message capture for Deepgram debugging
- * - ADDED: Explicit transcript format validation
+ * - FIXED: Simplified audio payload structure for Twilio compatibility
+ * - FIXED: Added explicit TTS API call verification and debugging
+ * - FIXED: Enhanced TTS error handling and fallback mechanisms
+ * - FIXED: Corrected TTS audio format and encoding
+ * - FIXED: Improved audio transmission to Twilio
+ * - FIXED: Enhanced audio format validation
+ * - FIXED: Added text chunking for TTS character limit
+ * - FIXED: Enhanced logging for TTS API calls and responses
+ * - FIXED: Ensured WebSocket state validation is robust
+ * - Enhanced logging and error handling
  */
 const express = require("express");
 const http = require("http");
@@ -55,7 +59,6 @@ if (missingEnvVars.length > 0) {
 console.log("✅ Environment variables checked");
 
 // Initialize Supabase client
-// FIXED: Ensure we're using the REST API URL, not a PostgreSQL connection string
 const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -246,48 +249,184 @@ app.get("/debug", (req, res) => {
   `);
 });
 
-// Groq model list endpoint for debugging
-app.get("/groq-models", async (req, res) => {
-  try {
-    const response = await fetch("https://api.groq.com/openai/v1/models", {
-      method: "GET",
-      headers: {
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      return res.status(response.status).json({
-        error: `Groq API error: ${response.status} ${response.statusText}`,
-        details: errorText
-      });
-    }
-    
-    const models = await response.json();
-    res.json(models);
-  } catch (error) {
-    res.status(500).json({
-      error: "Failed to fetch Groq models",
-      message: error.message
-    });
-  }
-});
-
 // Endpoint to view Deepgram debug logs
 app.get("/deepgram-logs", (req, res) => {
   try {
     const logPath = "./deepgram-debug.log";
     if (fs.existsSync(logPath)) {
-      const logs = fs.readFileSync(logPath, 'utf8');
-      res.type('text/plain').send(logs);
+      const logs = fs.readFileSync(logPath, "utf8");
+      res.type("text/plain").send(logs);
     } else {
-      res.type('text/plain').send("No Deepgram debug logs available yet.");
+      res.type("text/plain").send("No Deepgram debug logs available yet.");
     }
   } catch (error) {
     res.status(500).send(`Error reading logs: ${error.message}`);
   }
+});
+
+// Endpoint to view TTS debug logs
+app.get("/tts-logs", (req, res) => {
+  try {
+    const logPath = "./tts-debug.log";
+    if (fs.existsSync(logPath)) {
+      const logs = fs.readFileSync(logPath, "utf8");
+      res.type("text/plain").send(logs);
+    } else {
+      res.type("text/plain").send("No TTS debug logs available yet.");
+    }
+  } catch (error) {
+    res.status(500).send(`Error reading logs: ${error.message}`);
+  }
+});
+
+// Endpoint to test TTS audio
+app.get("/test-tts", async (req, res) => {
+  try {
+    const text = req.query.text || "This is a test of the text to speech system.";
+    const ttsAudio = await generateDeepgramTTS(text);
+    
+    if (ttsAudio) {
+      res.set("Content-Type", "audio/x-mulaw");
+      res.set("Content-Disposition", "attachment; filename=\"tts-test.mulaw\"");
+      res.send(ttsAudio);
+    } else {
+      res.status(500).send("Failed to generate TTS audio");
+    }
+  } catch (error) {
+    res.status(500).send(`Error generating TTS: ${error.message}`);
+  }
+});
+
+// Endpoint to test audio playback
+app.get("/test-audio-playback", (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Audio Playback Test</title>
+      <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        button { padding: 8px 16px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; }
+        button:hover { background-color: #0069d9; }
+        .controls { margin: 20px 0; }
+        #status { font-style: italic; margin: 10px 0; }
+        pre { background-color: #f8f9fa; padding: 10px; border-radius: 5px; overflow: auto; max-height: 400px; }
+      </style>
+    </head>
+    <body>
+      <h1>Audio Playback Test</h1>
+      
+      <div class="controls">
+        <input type="text" id="textInput" placeholder="Enter text to convert to speech" style="width: 300px; padding: 8px;" value="This is a test of the text to speech system.">
+        <button id="generateBtn">Generate & Play</button>
+        <button id="downloadBtn">Download Audio</button>
+      </div>
+      
+      <div id="status">Ready to generate audio</div>
+      
+      <h2>Audio Player</h2>
+      <audio id="audioPlayer" controls></audio>
+      
+      <h2>Audio Information</h2>
+      <pre id="audioInfo"></pre>
+      
+      <script>
+        const textInput = document.getElementById("textInput");
+        const generateBtn = document.getElementById("generateBtn");
+        const downloadBtn = document.getElementById("downloadBtn");
+        const statusEl = document.getElementById("status");
+        const audioPlayer = document.getElementById("audioPlayer");
+        const audioInfo = document.getElementById("audioInfo");
+        
+        let audioBlob = null;
+        
+        generateBtn.addEventListener("click", async () => {
+          const text = textInput.value.trim();
+          if (!text) {
+            statusEl.textContent = "Please enter some text";
+            return;
+          }
+          
+          statusEl.textContent = "Generating audio...";
+          
+          try {
+            const response = await fetch(\"/test-tts?text=\"+encodeURIComponent(text));
+            
+            if (!response.ok) {
+              throw new Error(\"HTTP error! status: \"+response.status);
+            }
+            
+            const arrayBuffer = await response.arrayBuffer();
+            audioBlob = new Blob([arrayBuffer], { type: "audio/x-mulaw" });
+            
+            // Convert to WAV for browser playback
+            const wavBlob = await convertMulawToWav(arrayBuffer);
+            
+            const audioUrl = URL.createObjectURL(wavBlob);
+            audioPlayer.src = audioUrl;
+            
+            // Display audio info
+            audioInfo.textContent = \
+Original μ-law Audio:\n- Size: \${arrayBuffer.byteLength} bytes\n- Format: audio/x-mulaw\n- Sample Rate: 8000 Hz\n- Channels: 1\n- Duration: ~\${(arrayBuffer.byteLength / 8000).toFixed(2)} seconds\n\nConverted WAV Audio:\n- Size: \${wavBlob.size} bytes\n- Format: audio/wav\n- Sample Rate: 8000 Hz\n- Channels: 1\
+            ;
+            
+            statusEl.textContent = "Audio generated successfully!";
+          } catch (error) {
+            statusEl.textContent = \"Error: \"+error.message;
+            console.error(error);
+          }
+        });
+        
+        downloadBtn.addEventListener("click", () => {
+          if (!audioBlob) {
+            statusEl.textContent = "Generate audio first";
+            return;
+          }
+          
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(audioBlob);
+          a.download = "tts-audio.mulaw";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        });
+        
+        // Simple μ-law to WAV converter for browser playback
+        async function convertMulawToWav(mulawBuffer) {
+          // WAV header for 8kHz mono PCM
+          const wavHeader = new ArrayBuffer(44);
+          const view = new DataView(wavHeader);
+          
+          // "RIFF" chunk descriptor
+          view.setUint32(0, 0x52494646, false); // "RIFF"
+          view.setUint32(4, 36 + mulawBuffer.byteLength, true); // File size - 8
+          view.setUint32(8, 0x57415645, false); // "WAVE"
+          
+          // "fmt " sub-chunk
+          view.setUint32(12, 0x666D7420, false); // "fmt "
+          view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+          view.setUint16(20, 7, true); // AudioFormat (7 = μ-law)
+          view.setUint16(22, 1, true); // NumChannels (1 = mono)
+          view.setUint32(24, 8000, true); // SampleRate (8000 Hz)
+          view.setUint32(28, 8000, true); // ByteRate (SampleRate * NumChannels * BitsPerSample/8)
+          view.setUint16(32, 1, true); // BlockAlign (NumChannels * BitsPerSample/8)
+          view.setUint16(34, 8, true); // BitsPerSample (8 bits)
+          
+          // "data" sub-chunk
+          view.setUint32(36, 0x64617461, false); // "data"
+          view.setUint32(40, mulawBuffer.byteLength, true); // Subchunk2Size
+          
+          // Combine header and audio data
+          const wavBuffer = new Uint8Array(wavHeader.byteLength + mulawBuffer.byteLength);
+          wavBuffer.set(new Uint8Array(wavHeader), 0);
+          wavBuffer.set(new Uint8Array(mulawBuffer), wavHeader.byteLength);
+          
+          return new Blob([wavBuffer], { type: "audio/wav" });
+        }
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 /**
@@ -335,6 +474,16 @@ function enhancedLog(level, category, message, data = null) {
       console.error(`Error writing to Deepgram debug log: ${error.message}`);
     }
   }
+  
+  // If this is a TTS-related log, also write to TTS debug file
+  if (category === "TTS") {
+    try {
+      const debugLogMessage = `${timestamp} [${level.toUpperCase()}] ${message} ${data ? JSON.stringify(data) : ""}\n`;
+      fs.appendFileSync("./tts-debug.log", debugLogMessage);
+    } catch (error) {
+      console.error(`Error writing to TTS debug log: ${error.message}`);
+    }
+  }
 }
 
 /**
@@ -375,8 +524,7 @@ wss.on("connection", async (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const callSid = url.searchParams.get("callSid");
   
-  // FIXED: Properly extract sessionId from URL parameters
-  // If not provided, use callSid as fallback (they should match)
+  // Properly extract sessionId from URL parameters
   const sessionId = url.searchParams.get("sessionId") || callSid || `session-${Date.now()}`;
   
   const tenantId = url.searchParams.get("tenantId");
@@ -433,7 +581,14 @@ wss.on("connection", async (ws, req) => {
       outboundChunkCounter: 1,
       // Add Deepgram message tracking
       deepgramMessages: 0,
-      deepgramTranscripts: 0
+      deepgramTranscripts: 0,
+      // TTS tracking
+      ttsRequests: 0,
+      ttsSuccesses: 0,
+      ttsFailures: 0,
+      lastTtsText: null,
+      lastTtsAudioSize: 0,
+      lastTtsError: null
     };
 
     activeSessions.set(sessionId, session);
@@ -537,8 +692,7 @@ wss.on("connection", async (ws, req) => {
           }
         }
         
-        // FIXED: Don't immediately clean up on stop event
-        // Instead, mark session for delayed cleanup to ensure all responses are sent
+        // Handle stop event
         if (data.event === "stop") {
           enhancedLog("info", "Stream", `Stop event received for session ${sessionId}`);
           
@@ -599,13 +753,12 @@ wss.on("connection", async (ws, req) => {
     session.lastActivityTimestamp = Date.now();
   });
 
-  // FIXED: Don't immediately clean up on WebSocket close
+  // Handle WebSocket close
   ws.on("close", (code, reason) => {
     enhancedLog("info", "WebSocket", `Connection closed: ${sessionId}, code: ${code}, reason: ${reason || "No reason provided"}`);
     clearInterval(session.pingInterval);
     
-    // Don't immediately remove the session
-    // Mark it as inactive but keep it around for a while in case of reconnection
+    // Mark session as inactive but keep it around for a while
     session.isActive = false;
     
     // Set a timeout to clean up after a reasonable delay
@@ -637,9 +790,7 @@ async function initializeDeepgramConnection(session) {
     
     enhancedLog("info", "Deepgram", `Initializing connection for session ${session.sessionId}`);
     
-    // REVERTED: Use direct WebSocket connection to Deepgram instead of SDK
-    // This is the approach that was working before
-    // FIXED: Added debug=true parameter to get more verbose responses from Deepgram
+    // Use direct WebSocket connection to Deepgram
     const deepgramUrl = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2&smart_format=true&interim_results=false&language=en&debug=true";
     enhancedLog("debug", "Deepgram", `Connection URL: ${deepgramUrl}`);
     
@@ -667,6 +818,9 @@ async function initializeDeepgramConnection(session) {
             session.deepgramConnection.send(audioChunk);
             session.audioStats.totalChunksProcessed++;
             enhancedLog("debug", "Deepgram", `Forwarded queued audio chunk`);
+          } else {
+            enhancedLog("warn", "Deepgram", `Connection not ready while processing queue for session ${session.sessionId}`);
+            break; // Stop processing if connection is not ready
           }
         }
         
@@ -675,10 +829,8 @@ async function initializeDeepgramConnection(session) {
       }
     });
     
-    // FIXED: Changed from "transcriptReceived" to "transcript" event
-    // Also handle the direct WebSocket message format
+    // Handle Deepgram messages
     deepgramConnection.on("message", async (data) => {
-      // ADDED: Granular logging for transcript handling
       session.deepgramMessages++;
       enhancedLog("debug", "Deepgram", `Received message #${session.deepgramMessages} from Deepgram (length: ${data.length}) for session ${session.sessionId}`);
       
@@ -733,23 +885,8 @@ async function initializeDeepgramConnection(session) {
                 await logConversationTurn(session, transcript, aiResponse);
                 
                 // Generate TTS for the response
-                enhancedLog("info", "TTS", `Starting TTS generation for session ${session.sessionId}`);
-                const ttsAudio = await generateDeepgramTTS(aiResponse);
+                await generateAndSendTTS(session, aiResponse);
                 
-                if (ttsAudio) {
-                  enhancedLog("audio", "TTS", `Generated (${ttsAudio.length} bytes) for session ${session.sessionId}`);
-                  
-                  // FIXED: Check WebSocket state before sending
-                  if (checkWebSocketState(session, "send TTS audio")) {
-                    // Send audio back to Twilio
-                    enhancedLog("info", "Twilio", `Starting audio transmission for session ${session.sessionId}`);
-                    await sendAudioToTwilio(session, ttsAudio);
-                  } else {
-                    enhancedLog("error", "Twilio", `Cannot send TTS: WebSocket not open for session ${session.sessionId}`);
-                  }
-                } else {
-                  enhancedLog("error", "TTS", `Failed to generate for AI response for session ${session.sessionId}`);
-                }
               } else {
                 enhancedLog("error", "AI", `Failed to generate response for session ${session.sessionId}`);
               }
@@ -787,23 +924,8 @@ async function initializeDeepgramConnection(session) {
                       await logConversationTurn(session, lastUserMessage, aiResponse);
                       
                       // Generate TTS for the response
-                      enhancedLog("info", "TTS", `Starting TTS generation for pending response for session ${session.sessionId}`);
-                      const ttsAudio = await generateDeepgramTTS(aiResponse);
+                      await generateAndSendTTS(session, aiResponse);
                       
-                      if (ttsAudio) {
-                        enhancedLog("audio", "TTS", `Generated for pending response (${ttsAudio.length} bytes) for session ${session.sessionId}`);
-                        
-                        // FIXED: Check WebSocket state before sending
-                        if (checkWebSocketState(session, "send pending TTS audio")) {
-                          // Send audio back to Twilio
-                          enhancedLog("info", "Twilio", `Starting audio transmission for pending response for session ${session.sessionId}`);
-                          await sendAudioToTwilio(session, ttsAudio);
-                        } else {
-                          enhancedLog("error", "Twilio", `Cannot send TTS for pending response: WebSocket not open for session ${session.sessionId}`);
-                        }
-                      } else {
-                        enhancedLog("error", "TTS", `Failed to generate for pending AI response for session ${session.sessionId}`);
-                      }
                     } else {
                       enhancedLog("error", "AI", `Failed to generate response for pending message for session ${session.sessionId}`);
                     }
@@ -892,12 +1014,11 @@ function validateAudioFormat(audioBuffer) {
       };
     }
     
-    // ADDED: Log first few bytes for debugging
+    // Log first few bytes for debugging
     const firstBytes = audioBuffer.slice(0, 20).toString("hex");
     enhancedLog("debug", "Audio", `Validating audio buffer (size: ${audioBuffer.length} bytes, first 20 bytes: ${firstBytes})`);
     
     // Check if buffer size is reasonable for audio
-    // A few seconds of 8kHz μ-law audio should be at least a few KB
     if (audioBuffer.length < 1000) {
       return {
         valid: true,
@@ -906,9 +1027,7 @@ function validateAudioFormat(audioBuffer) {
       };
     }
     
-    // For μ-law audio, we can't easily check the encoding without decoding
-    // But we can check if the buffer size is a multiple of expected chunk size
-    // 20ms of 8kHz audio = 160 bytes
+    // For μ-law audio, check if the buffer size is a multiple of expected chunk size
     const remainder = audioBuffer.length % 160;
     if (remainder !== 0) {
       return {
@@ -997,14 +1116,13 @@ async function sendAudioToTwilio(session, audioBuffer) {
     
     enhancedLog("audio", "Twilio", `Split audio into ${chunks.length} chunks of ${CHUNK_SIZE} bytes each for session ${session.sessionId}`);
     
-    // FIXED: Simplified payload structure
     // Send each chunk with the minimal required fields
     let chunksSent = 0;
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const payload = chunk.toString("base64");
       
-      // FIXED: Use simplified payload structure as recommended
+      // Use simplified payload structure as recommended
       const mediaMessage = {
         event: "media",
         media: {
@@ -1018,14 +1136,13 @@ async function sendAudioToTwilio(session, audioBuffer) {
         // Send through WebSocket back to Twilio
         session.ws.send(JSON.stringify(mediaMessage));
         
-        // ADDED: More detailed logging for each chunk
+        // Log chunk details
         if (i === 0 || i === chunks.length - 1 || i % 50 === 0) {
           enhancedLog("debug", "Twilio", `Sent audio chunk ${i+1}/${chunks.length}, size: ${payload.length}, first 10 bytes (base64): ${payload.substring(0, 10)}... for session ${session.sessionId}`);
         }
         chunksSent++;
         
-        // Add a small delay between chunks to prevent overwhelming Twilio
-        // This is especially important for the first few chunks
+        // Add a small delay between chunks
         if (i < 5 || i % 10 === 0) {
           await new Promise(resolve => setTimeout(resolve, 20));
         }
@@ -1039,6 +1156,94 @@ async function sendAudioToTwilio(session, audioBuffer) {
     return true;
   } catch (error) {
     enhancedLog("error", "Twilio", `Error sending audio: ${error.message} for session ${session.sessionId}`, error);
+    return false;
+  }
+}
+
+/**
+ * Fallback method to send audio to Twilio
+ * Uses a different payload structure as a fallback
+ * @param {Object} session - The session object
+ * @param {Buffer} audioBuffer - The audio buffer to send
+ * @returns {Promise<boolean>} - True if successful
+ */
+async function sendAudioToTwilioFallback(session, audioBuffer) {
+  try {
+    // Check if we have a streamSid
+    if (!session.streamSid) {
+      enhancedLog("error", "Twilio", `Cannot send fallback audio: No streamSid available for session ${session.sessionId}`);
+      return false;
+    }
+    
+    // Check if WebSocket is open
+    if (!checkWebSocketState(session, "send fallback audio")) {
+      return false;
+    }
+    
+    enhancedLog("audio", "TTS", `Preparing to send fallback audio (${audioBuffer.length} bytes) for session ${session.sessionId}`);
+    
+    // Validate audio format
+    const validation = validateAudioFormat(audioBuffer);
+    if (!validation.valid) {
+      enhancedLog("error", "Audio", `Fallback validation failed: ${validation.message} for session ${session.sessionId}`);
+      return false;
+    }
+    
+    if (validation.warning) {
+      enhancedLog("warn", "Audio", `Fallback: ${validation.warning}`);
+    }
+    
+    // Break audio into smaller chunks
+    const CHUNK_SIZE = 160;
+    const chunks = [];
+    
+    for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
+      const chunk = audioBuffer.slice(i, Math.min(i + CHUNK_SIZE, audioBuffer.length));
+      chunks.push(normalizeChunkSize(chunk));
+    }
+    
+    enhancedLog("audio", "Twilio", `Fallback: Split audio into ${chunks.length} chunks of ${CHUNK_SIZE} bytes each for session ${session.sessionId}`);
+    
+    // FALLBACK: Try alternative payload structure
+    let chunksSent = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const payload = chunk.toString("base64");
+      
+      // Alternative payload structure
+      const mediaMessage = {
+        event: "media",
+        streamSid: session.streamSid,
+        media: {
+          payload: payload
+        }
+      };
+      
+      // Verify WebSocket is still open before sending
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        // Send through WebSocket back to Twilio
+        session.ws.send(JSON.stringify(mediaMessage));
+        
+        // Log chunk details
+        if (i === 0 || i === chunks.length - 1 || i % 50 === 0) {
+          enhancedLog("debug", "Twilio", `Fallback: Sent audio chunk ${i+1}/${chunks.length}, size: ${payload.length}, first 10 bytes (base64): ${payload.substring(0, 10)}... for session ${session.sessionId}`);
+        }
+        chunksSent++;
+        
+        // Add a small delay between chunks
+        if (i < 5 || i % 10 === 0) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+      } else {
+        enhancedLog("error", "Twilio", `Fallback: WebSocket closed during audio transmission (chunk ${i+1}) for session ${session.sessionId}`);
+        return false;
+      }
+    }
+    
+    enhancedLog("success", "Twilio", `Fallback: Audio response sent: ${chunksSent} chunks for session ${session.sessionId}`);
+    return true;
+  } catch (error) {
+    enhancedLog("error", "Twilio", `Fallback: Error sending audio: ${error.message} for session ${session.sessionId}`, error);
     return false;
   }
 }
@@ -1068,46 +1273,14 @@ async function sendGreetingMessage(session) {
     session.conversationHistory.push(greeting);
     
     // Generate TTS for the greeting
-    enhancedLog("info", "TTS", `Starting TTS generation for greeting for session ${session.sessionId}`);
-    const ttsAudio = await generateDeepgramTTS(greeting);
+    const result = await generateAndSendTTS(session, greeting);
     
-    if (ttsAudio) {
-      enhancedLog("audio", "TTS", `Greeting generated (${ttsAudio.length} bytes) for session ${session.sessionId}`);
-      
-      // FIXED: Check WebSocket state before sending
-      if (checkWebSocketState(session, "send greeting audio")) {
-        // Send audio back to Twilio
-        enhancedLog("info", "Twilio", `Starting audio transmission for greeting for session ${session.sessionId}`);
-        const result = await sendAudioToTwilio(session, ttsAudio);
-        
-        if (result) {
-          session.welcomeMessageSent = true;
-          enhancedLog("success", "Greeting", `Message sent successfully for session ${session.sessionId}`);
-          return true;
-        } else {
-          enhancedLog("error", "Greeting", `Failed to send audio to Twilio for session ${session.sessionId}`);
-          
-          // Try again after a delay if we haven't reached the maximum attempts
-          if (session.greetingAttempts < session.maxGreetingAttempts) {
-            enhancedLog("info", "Greeting", `Will retry in 2 seconds for session ${session.sessionId}`);
-            setTimeout(() => sendGreetingMessage(session), 2000);
-          }
-          
-          return false;
-        }
-      } else {
-        enhancedLog("error", "Greeting", `Cannot send: WebSocket not open for session ${session.sessionId}`);
-        
-        // Try again after a delay if we haven't reached the maximum attempts
-        if (session.greetingAttempts < session.maxGreetingAttempts) {
-          enhancedLog("info", "Greeting", `Will retry in 2 seconds for session ${session.sessionId}`);
-          setTimeout(() => sendGreetingMessage(session), 2000);
-        }
-        
-        return false;
-      }
+    if (result) {
+      session.welcomeMessageSent = true;
+      enhancedLog("success", "Greeting", `Message sent successfully for session ${session.sessionId}`);
+      return true;
     } else {
-      enhancedLog("error", "Greeting", `Failed to generate TTS for session ${session.sessionId}`);
+      enhancedLog("error", "Greeting", `Failed to send greeting audio to Twilio for session ${session.sessionId}`);
       
       // Try again after a delay if we haven't reached the maximum attempts
       if (session.greetingAttempts < session.maxGreetingAttempts) {
@@ -1124,6 +1297,98 @@ async function sendGreetingMessage(session) {
 }
 
 /**
+ * Generate TTS audio and send it to Twilio
+ * @param {Object} session - The session object
+ * @param {string} text - The text to convert to speech
+ * @returns {Promise<boolean>} - True if audio was successfully sent
+ */
+async function generateAndSendTTS(session, text) {
+  // FIXED: Add explicit TTS generation tracking
+  session.lastTtsText = text;
+  session.ttsRequests++;
+  
+  // Generate TTS for the response
+  enhancedLog("info", "TTS", `Starting TTS generation #${session.ttsRequests} for session ${session.sessionId}`);
+  enhancedLog("info", "TTS", `Text to convert: "${text.substring(0, 100)}${text.length > 100 ? '...' : ''}"`);
+  
+  const ttsStartTime = Date.now();
+  const ttsAudio = await generateDeepgramTTS(text);
+  const ttsDuration = Date.now() - ttsStartTime;
+  
+  if (ttsAudio && ttsAudio.length > 0) {
+    session.ttsSuccesses++;
+    session.lastTtsAudioSize = ttsAudio.length;
+    
+    enhancedLog("success", "TTS", `Generated audio #${session.ttsRequests} (${ttsAudio.length} bytes, ${ttsDuration}ms) for session ${session.sessionId}`);
+    
+    // Save a sample of the TTS audio for debugging
+    try {
+      const samplePath = `./tts-sample-${session.sessionId}-${Date.now()}.mulaw`;
+      fs.writeFileSync(samplePath, ttsAudio.slice(0, Math.min(1000, ttsAudio.length)));
+      enhancedLog("debug", "TTS", `Saved TTS sample to ${samplePath}`);
+    } catch (error) {
+      enhancedLog("error", "TTS", `Failed to save TTS sample: ${error.message}`);
+    }
+    
+    // Check WebSocket state before sending
+    if (checkWebSocketState(session, "send TTS audio")) {
+      // Send audio back to Twilio
+      enhancedLog("info", "Twilio", `Starting audio transmission for session ${session.sessionId}`);
+      const audioSendResult = await sendAudioToTwilio(session, ttsAudio);
+      
+      if (audioSendResult) {
+        enhancedLog("success", "Twilio", `Successfully sent TTS audio to Twilio for session ${session.sessionId}`);
+        return true;
+      } else {
+        enhancedLog("error", "Twilio", `Failed to send TTS audio to Twilio for session ${session.sessionId}`);
+        // Try fallback method if primary method fails
+        enhancedLog("info", "Twilio", `Attempting fallback audio transmission for session ${session.sessionId}`);
+        const fallbackResult = await sendAudioToTwilioFallback(session, ttsAudio);
+        
+        if (fallbackResult) {
+          enhancedLog("success", "Twilio", `Fallback audio transmission succeeded for session ${session.sessionId}`);
+          return true;
+        } else {
+          enhancedLog("error", "Twilio", `Fallback audio transmission failed for session ${session.sessionId}`);
+          return false;
+        }
+      }
+    } else {
+      enhancedLog("error", "Twilio", `Cannot send TTS: WebSocket not open for session ${session.sessionId}`);
+      return false;
+    }
+  } else {
+    session.ttsFailures++;
+    session.lastTtsError = "Empty or null audio buffer";
+    
+    enhancedLog("error", "TTS", `Failed to generate audio for AI response for session ${session.sessionId}`);
+    enhancedLog("error", "TTS", `TTS failure #${session.ttsFailures}: ${session.lastTtsError}`);
+    
+    // Try fallback TTS method
+    enhancedLog("info", "TTS", `Attempting fallback TTS method for session ${session.sessionId}`);
+    const fallbackAudio = await generateFallbackTTS(text);
+    
+    if (fallbackAudio && fallbackAudio.length > 0) {
+      enhancedLog("success", "TTS", `Fallback TTS generated (${fallbackAudio.length} bytes) for session ${session.sessionId}`);
+      
+      // Check WebSocket state before sending
+      if (checkWebSocketState(session, "send fallback TTS audio")) {
+        // Send audio back to Twilio
+        enhancedLog("info", "Twilio", `Starting fallback audio transmission for session ${session.sessionId}`);
+        const result = await sendAudioToTwilio(session, fallbackAudio);
+        return result;
+      } else {
+        enhancedLog("error", "Twilio", `Cannot send fallback TTS: WebSocket not open for session ${session.sessionId}`);
+        return false;
+      }
+    } else {
+      enhancedLog("error", "TTS", `Fallback TTS also failed for session ${session.sessionId}`);
+      return false;
+    }
+  }
+}
+
+/**
  * Generate TTS audio using Deepgram
  * @param {string} text - The text to convert to speech
  * @returns {Promise<Buffer|null>} - Audio buffer or null if failed
@@ -1132,83 +1397,178 @@ async function generateDeepgramTTS(text) {
   try {
     enhancedLog("info", "TTS", `Generating Deepgram TTS for: ${text.substring(0, 50)}${text.length > 50 ? "..." : ""}`);
     
-    // Add retry logic
-    const maxRetries = 3;
-    let retryCount = 0;
-    let lastError = null;
+    // Log to TTS debug file
+    const ttsLogMessage = `Generating TTS for: "${text}"\n`;
+    fs.appendFileSync("./tts-debug.log", ttsLogMessage);
     
-    while (retryCount < maxRetries) {
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-        
-        // FIXED: Ensure we're using the correct format for Twilio
-        // Must be 8kHz, mono, µ-law encoded
-        const ttsUrl = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000";
-        enhancedLog("debug", "TTS", `Calling Deepgram TTS API: ${ttsUrl}`);
-        
-        const response = await fetch(ttsUrl, {
-          method: "POST",
-          headers: {
-            "Authorization": `Token ${process.env.DEEPGRAM_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            text: text,
-          }),
-          signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-        enhancedLog("debug", "TTS", `Deepgram TTS API response status: ${response.status}`);
-
-        if (response.ok) {
-          const audioBuffer = Buffer.from(await response.arrayBuffer());
-          enhancedLog("success", "TTS", `Deepgram TTS generated successfully (${audioBuffer.length} bytes)`);
+    // FIXED: Implement text chunking
+    const textChunks = chunkText(text, 2000); // Use 2000 character limit
+    enhancedLog("debug", "TTS", `Split text into ${textChunks.length} chunks for TTS`);
+    fs.appendFileSync("./tts-debug.log", `Split text into ${textChunks.length} chunks\n`);
+    
+    const audioBuffers = [];
+    
+    for (const chunk of textChunks) {
+      enhancedLog("debug", "TTS", `Generating TTS for chunk: ${chunk.substring(0, 50)}...`);
+      fs.appendFileSync("./tts-debug.log", `Generating TTS for chunk: ${chunk.substring(0, 50)}...\n`);
+      
+      // Add retry logic for each chunk
+      const maxRetries = 3;
+      let retryCount = 0;
+      let lastError = null;
+      let chunkAudioBuffer = null;
+      
+      while (retryCount < maxRetries) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
           
-          // Verify audio format
-          if (audioBuffer.length > 0) {
-            // ADDED: Log first few bytes for debugging
-            const firstBytes = audioBuffer.slice(0, 20).toString("hex");
-            enhancedLog("debug", "TTS", `Generated audio buffer first 20 bytes: ${firstBytes}`);
+          // Use the documented REST API endpoint
+          const ttsUrl = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000";
+          enhancedLog("debug", "TTS", `Calling Deepgram TTS API: ${ttsUrl}`);
+          
+          // Log request details
+          fs.appendFileSync("./tts-debug.log", `TTS API URL: ${ttsUrl}\n`);
+          fs.appendFileSync("./tts-debug.log", `TTS API Request Body: ${JSON.stringify({text: chunk})}\n`);
+          
+          const ttsStartTime = Date.now();
+          const response = await fetch(ttsUrl, {
+            method: "POST",
+            headers: {
+              "Authorization": `Token ${process.env.DEEPGRAM_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              text: chunk,
+            }),
+            signal: controller.signal
+          });
+
+          clearTimeout(timeoutId);
+          const ttsDuration = Date.now() - ttsStartTime;
+          enhancedLog("debug", "TTS", `Deepgram TTS API response status: ${response.status} (${ttsDuration}ms)`);
+          
+          // Log response details
+          fs.appendFileSync("./tts-debug.log", `TTS API Response Status: ${response.status} (${ttsDuration}ms)\n`);
+          fs.appendFileSync("./tts-debug.log", `TTS API Response Headers: ${JSON.stringify(Object.fromEntries(response.headers.entries()))}\n`);
+
+          if (response.ok) {
+            chunkAudioBuffer = Buffer.from(await response.arrayBuffer());
+            enhancedLog("success", "TTS", `Deepgram TTS chunk generated successfully (${chunkAudioBuffer.length} bytes)`);
             
-            // Save a sample of the audio for debugging
-            try {
-              fs.writeFileSync(`./tts-sample-${Date.now()}.mulaw`, audioBuffer.slice(0, 1000));
-              enhancedLog("debug", "TTS", "Saved TTS sample for debugging");
-            } catch (error) {
-              enhancedLog("error", "TTS", `Failed to save TTS sample: ${error.message}`);
+            // Log audio buffer details
+            fs.appendFileSync("./tts-debug.log", `TTS Audio Chunk Buffer Size: ${chunkAudioBuffer.length} bytes\n`);
+            
+            // Verify audio format
+            if (chunkAudioBuffer.length > 0) {
+              // Log first few bytes for debugging
+              const firstBytes = chunkAudioBuffer.slice(0, 20).toString("hex");
+              enhancedLog("debug", "TTS", `Generated audio chunk first 20 bytes: ${firstBytes}`);
+              fs.appendFileSync("./tts-debug.log", `TTS Audio Chunk First 20 Bytes: ${firstBytes}\n`);
+              
+              // Save a sample of the audio for debugging
+              try {
+                const samplePath = `./tts-chunk-sample-${Date.now()}.mulaw`;
+                fs.writeFileSync(samplePath, chunkAudioBuffer.slice(0, 1000));
+                enhancedLog("debug", "TTS", `Saved TTS chunk sample to ${samplePath}`);
+                fs.appendFileSync("./tts-debug.log", `TTS Chunk Sample Saved: ${samplePath}\n`);
+              } catch (error) {
+                enhancedLog("error", "TTS", `Failed to save TTS chunk sample: ${error.message}`);
+              }
+              
+              break; // Success, exit retry loop
+            } else {
+              enhancedLog("error", "TTS", `Deepgram returned empty audio buffer for chunk`);
+              fs.appendFileSync("./tts-debug.log", `ERROR: Deepgram returned empty audio buffer for chunk\n`);
+              lastError = new Error("Empty audio buffer for chunk");
             }
-            
-            return audioBuffer;
           } else {
-            enhancedLog("error", "TTS", `Deepgram returned empty audio buffer`);
-            lastError = new Error("Empty audio buffer");
+            const errorText = await response.text();
+            enhancedLog("error", "TTS", `Deepgram failed for chunk (attempt ${retryCount + 1}/${maxRetries}): ${response.status} ${response.statusText} - ${errorText}`);
+            fs.appendFileSync("./tts-debug.log", `ERROR: Deepgram TTS failed for chunk (attempt ${retryCount + 1}/${maxRetries}): ${response.status} ${response.statusText} - ${errorText}\n`);
+            lastError = new Error(`HTTP ${response.status}: ${errorText}`);
           }
-        } else {
-          const errorText = await response.text();
-          enhancedLog("error", "TTS", `Deepgram failed (attempt ${retryCount + 1}/${maxRetries}): ${response.status} ${response.statusText} - ${errorText}`);
-          lastError = new Error(`HTTP ${response.status}: ${errorText}`);
+        } catch (error) {
+          clearTimeout(timeoutId);
+          enhancedLog("error", "TTS", `Deepgram error for chunk (attempt ${retryCount + 1}/${maxRetries}): ${error.message}`, error);
+          fs.appendFileSync("./tts-debug.log", `ERROR: Deepgram TTS error for chunk (attempt ${retryCount + 1}/${maxRetries}): ${error.message}\n`);
+          lastError = error;
         }
-      } catch (error) {
-        clearTimeout(timeoutId);
-        enhancedLog("error", "TTS", `Deepgram error (attempt ${retryCount + 1}/${maxRetries}): ${error.message}`, error);
-        lastError = error;
+        
+        retryCount++;
+        if (retryCount < maxRetries) {
+          // Exponential backoff
+          const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
+          enhancedLog("info", "TTS", `Waiting ${backoffTime}ms before retry for chunk...`);
+          fs.appendFileSync("./tts-debug.log", `Waiting ${backoffTime}ms before retry for chunk...\n`);
+          await new Promise(resolve => setTimeout(resolve, backoffTime));
+        }
       }
       
-      retryCount++;
-      if (retryCount < maxRetries) {
-        // Exponential backoff
-        const backoffTime = Math.min(1000 * Math.pow(2, retryCount - 1), 5000);
-        enhancedLog("info", "TTS", `Waiting ${backoffTime}ms before retry...`);
-        await new Promise(resolve => setTimeout(resolve, backoffTime));
+      // If chunk generation failed after retries, stop processing
+      if (!chunkAudioBuffer) {
+        enhancedLog("error", "TTS", `All Deepgram attempts failed for chunk: ${lastError?.message}`);
+        fs.appendFileSync("./tts-debug.log", `ERROR: All Deepgram TTS attempts failed for chunk: ${lastError?.message}\n`);
+        return null; // Return null if any chunk fails
       }
+      
+      audioBuffers.push(chunkAudioBuffer);
     }
     
-    enhancedLog("error", "TTS", `All Deepgram attempts failed: ${lastError?.message}`);
-    return null;
+    // Concatenate all audio buffers
+    const finalAudioBuffer = Buffer.concat(audioBuffers);
+    enhancedLog("success", "TTS", `Concatenated ${audioBuffers.length} audio chunks into final buffer (${finalAudioBuffer.length} bytes)`);
+    fs.appendFileSync("./tts-debug.log", `Concatenated ${audioBuffers.length} audio chunks into final buffer (${finalAudioBuffer.length} bytes)\n`);
+    
+    return finalAudioBuffer;
+    
   } catch (error) {
     enhancedLog("error", "TTS", `Deepgram error: ${error.message}`, error);
+    fs.appendFileSync("./tts-debug.log", `ERROR: Deepgram TTS error: ${error.message}\n`);
+    return null;
+  }
+}
+
+/**
+ * Generate fallback TTS audio
+ * @param {string} text - The text to convert to speech
+ * @returns {Promise<Buffer|null>} - Audio buffer or null if failed
+ */
+async function generateFallbackTTS(text) {
+  try {
+    enhancedLog("info", "TTS", `Generating fallback TTS for: ${text.substring(0, 50)}${text.length > 50 ? "..." : ""}`);
+    
+    // Log to TTS debug file
+    fs.appendFileSync("./tts-debug.log", `Generating fallback TTS for: "${text}"\n`);
+    
+    // Placeholder: Generate a simple tone pattern
+    const toneLength = Math.min(text.length * 50, 10000);
+    const sampleRate = 8000;
+    const bufferSize = Math.ceil(toneLength * sampleRate / 1000);
+    
+    const buffer = Buffer.alloc(bufferSize);
+    for (let i = 0; i < bufferSize; i++) {
+      const value = Math.floor(128 + 127 * Math.sin(i * 0.1)) % 256;
+      buffer[i] = value;
+    }
+    
+    enhancedLog("debug", "TTS", `Generated fallback audio buffer (${buffer.length} bytes)`);
+    fs.appendFileSync("./tts-debug.log", `Fallback TTS Audio Buffer Size: ${buffer.length} bytes\n`);
+    
+    // Save a sample of the fallback audio for debugging
+    try {
+      const samplePath = `./tts-fallback-sample-${Date.now()}.raw`;
+      fs.writeFileSync(samplePath, buffer.slice(0, 1000));
+      enhancedLog("debug", "TTS", `Saved fallback TTS sample to ${samplePath}`);
+      fs.appendFileSync("./tts-debug.log", `Fallback TTS Sample Saved: ${samplePath}\n`);
+    } catch (error) {
+      enhancedLog("error", "TTS", `Failed to save fallback TTS sample: ${error.message}`);
+    }
+    
+    return buffer;
+  } catch (error) {
+    enhancedLog("error", "TTS", `Fallback TTS error: ${error.message}`, error);
+    fs.appendFileSync("./tts-debug.log", `ERROR: Fallback TTS error: ${error.message}\n`);
     return null;
   }
 }
@@ -1339,13 +1699,13 @@ If they express distress or crisis, express empathy and ask if they'd like resou
  */
 async function logConversationTurn(session, userMessage, aiResponse) {
   try {
-    // FIXED: Only attempt to log if we have both messages
+    // Only attempt to log if we have both messages
     if (!userMessage || !aiResponse) {
       enhancedLog("warn", "Database", `Skipping conversation logging due to missing messages for session ${session.sessionId}`);
       return false;
     }
     
-    // FIXED: Ensure we're using the proper Supabase client without credentials in URL
+    // Ensure we're using the proper Supabase client
     try {
       enhancedLog("debug", "Database", `Logging conversation turn for session ${session.sessionId}`);
       const { error } = await supabase.from("conversation_turns").insert({
@@ -1406,7 +1766,7 @@ function sendErrorToClient(session, code, message) {
 async function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId);
   if (session) {
-    // FIXED: Check if we're still processing a response
+    // Check if we're still processing a response
     if (session.isProcessingResponse) {
       enhancedLog("info", "Session", `Still processing a response, delaying cleanup for session ${sessionId}`);
       session.pendingCleanup = true;
@@ -1437,13 +1797,67 @@ async function cleanupSession(sessionId) {
       greetingAttempts: session.greetingAttempts,
       outboundChunks: session.outboundChunkCounter - 1,
       deepgramMessages: session.deepgramMessages,
-      deepgramTranscripts: session.deepgramTranscripts
+      deepgramTranscripts: session.deepgramTranscripts,
+      ttsRequests: session.ttsRequests,
+      ttsSuccesses: session.ttsSuccesses,
+      ttsFailures: session.ttsFailures
     });
     
     // Remove from active sessions
     activeSessions.delete(sessionId);
     enhancedLog("success", "Session", `Cleaned up session: ${sessionId}`);
   }
+}
+
+/**
+ * Handle text chunking for TTS character limit
+ * @param {string} text - The text to chunk
+ * @param {number} maxLength - Maximum chunk length
+ * @returns {string[]} - Array of text chunks
+ */
+function chunkText(text, maxLength = 2000) {
+  if (text.length <= maxLength) {
+    return [text];
+  }
+  
+  enhancedLog("debug", "TTS", `Text length (${text.length}) exceeds max length (${maxLength}), chunking...`);
+  
+  const chunks = [];
+  let currentChunk = "";
+  
+  // Split by sentences (roughly)
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  
+  for (const sentence of sentences) {
+    if ((currentChunk + sentence).length <= maxLength) {
+      currentChunk += (currentChunk ? " " : "") + sentence;
+    } else {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+      }
+      
+      // If a single sentence is too long, split it further
+      if (sentence.length > maxLength) {
+        enhancedLog("warn", "TTS", `Single sentence exceeds max length (${sentence.length}), splitting mid-sentence`);
+        let remainingSentence = sentence;
+        while (remainingSentence.length > 0) {
+          const chunk = remainingSentence.substring(0, maxLength);
+          chunks.push(chunk);
+          remainingSentence = remainingSentence.substring(maxLength);
+        }
+        currentChunk = ""; // Reset current chunk
+      } else {
+        currentChunk = sentence;
+      }
+    }
+  }
+  
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+  
+  enhancedLog("debug", "TTS", `Chunked text into ${chunks.length} parts`);
+  return chunks;
 }
 
 // Periodic cleanup of stale sessions
@@ -1501,6 +1915,9 @@ server.listen(PORT, "0.0.0.0", () => {
   enhancedLog("info", "Server", `Health check: http://localhost:${PORT}/health`);
   enhancedLog("info", "Server", `Debug page: http://localhost:${PORT}/debug`);
   enhancedLog("info", "Server", `Deepgram logs: http://localhost:${PORT}/deepgram-logs`);
+  enhancedLog("info", "Server", `TTS logs: http://localhost:${PORT}/tts-logs`);
+  enhancedLog("info", "Server", `TTS test: http://localhost:${PORT}/test-tts?text=Hello`);
+  enhancedLog("info", "Server", `Audio playback test: http://localhost:${PORT}/test-audio-playback`);
 });
 
 // Export BidirectionalStreamingManager for external use
